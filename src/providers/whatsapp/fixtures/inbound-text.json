@@ -1,0 +1,35 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15550783881",
+              "phone_number_id": "106540352242922"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Rafael" },
+                "wa_id": "5511999998888"
+              }
+            ],
+            "messages": [
+              {
+                "from": "5511999998888",
+                "id": "wamid.HBgNNTUxMTk5OTk5ODg4OBUCABIYFjNFQjBEMUZFNkU1Qjk2NzA1RkE3AA==",
+                "timestamp": "1749600000",
+                "type": "text",
+                "text": { "body": "Olá, mundo!" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

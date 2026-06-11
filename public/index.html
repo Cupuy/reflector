@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reflector — laboratório de canais</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; }
+  header h1 span { color: var(--muted); font-weight: normal; }
+  header .spacer { flex: 1; }
+  label.toggle { color: var(--muted); cursor: pointer; user-select: none; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  main { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; padding: 16px 20px; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .card.highlight { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; padding: 0 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+  .badge.sent { color: var(--muted); }
+  .badge.delivered { color: var(--accent); border-color: var(--accent); }
+  .badge.read { color: var(--ok); border-color: var(--ok); }
+  .badge.failed { color: var(--err); border-color: var(--err); }
+  .badge.sig-ok { color: var(--ok); border-color: var(--ok); }
+  .badge.sig-bad { color: var(--err); border-color: var(--err); }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+  pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; max-height: 320px; }
+  .timeline { margin: 8px 0 0; padding: 0; list-style: none; }
+  .timeline li { padding: 4px 0 4px 16px; border-left: 2px solid var(--border); }
+  .timeline li:first-child { border-left-color: var(--accent); }
+  a.wr-link { color: var(--accent); text-decoration: none; font-size: 12px; }
+  a.wr-link:hover { text-decoration: underline; }
+  .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-top: 8px; }
+  form.send { display: flex; gap: 8px; padding: 0 20px 4px; flex-wrap: wrap; align-items: center; }
+  form.send input { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; }
+  form.send input[name=text] { flex: 1; min-width: 200px; }
+  .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  .actions button { padding: 2px 10px; font-size: 12px; }
+  .actions input { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 2px 8px; font: inherit; font-size: 12px; flex: 1; min-width: 120px; }
+  .actions .feedback { font-size: 11px; }
+  #send-result { padding: 0 20px 8px; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>reflector <span>— laboratório de canais</span></h1>
+  <div class="spacer"></div>
+  <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh (4s)</label>
+  <button id="refresh">atualizar</button>
+</header>
+
+<form class="send" id="send-form">
+  <input name="to" placeholder="destinatário (ex: 5511999998888)" required>
+  <input name="text" placeholder="mensagem de texto" required>
+  <button type="submit">enviar via whatsapp</button>
+</form>
+<div id="send-result"></div>
+
+<main>
+  <section>
+    <h2>Enviadas (API → canal)</h2>
+    <div id="outbound"></div>
+  </section>
+  <section>
+    <h2>Recebidas (canal → webhook)</h2>
+    <div id="inbound"></div>
+  </section>
+  <section>
+    <h2>Webhook requests (brutas)</h2>
+    <div id="webhooks"></div>
+  </section>
+</main>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function pretty(value) {
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { /* mantém como string */ }
+  }
+  return esc(JSON.stringify(value, null, 2));
+}
+
+function fmtDate(iso) {
+  return iso ? new Date(iso).toLocaleString('pt-BR') : '';
+}
+
+function contentSummary(content) {
+  if (!content || !content.kind) return '(sem conteúdo)';
+  if (content.kind === 'text') return '"' + content.text + '"';
+  if (content.kind === 'template') return 'template: ' + content.name;
+  if (content.kind === 'media') return 'mídia: ' + content.mediaType;
+  if (content.kind === 'reaction') return 'reação: ' + (content.emoji || '(removida)');
+  if (content.kind === 'choice') return 'escolha [' + content.source + ']: ' + content.label;
+  if (content.kind === 'location') return 'localização: ' + content.latitude + ', ' + content.longitude;
+  if (content.kind === 'contacts') return 'contatos (' + content.contacts.length + ')';
+  if (content.kind === 'unsupported') return 'não suportado: ' + content.nativeType;
+  return content.kind;
+}
+
+function wrLink(id) {
+  return '<a class="wr-link" href="#wr-' + id + '" data-wr="' + id + '">request #' + id + '</a>';
+}
+
+function statusBadge(status) {
+  return '<span class="badge ' + esc(status) + '">' + esc(status) + '</span>';
+}
+
+// preserva <details> abertos entre re-renders
+function openKeys() {
+  return new Set([...document.querySelectorAll('details[open][data-key]')].map((d) => d.dataset.key));
+}
+function restoreOpen(keys) {
+  for (const d of document.querySelectorAll('details[data-key]')) {
+    if (keys.has(d.dataset.key)) d.open = true;
+  }
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(url + ' → ' + res.status);
+  return res.json();
+}
+
+function renderOutbound(messages, timelines) {
+  if (!messages.length) return '<div class="empty">nenhuma mensagem enviada ainda</div>';
+  return messages.map((m) => {
+    const timeline = timelines[m.providerMessageId];
+    const statuses = timeline ? timeline.statuses : [];
+    const chain = statuses.length
+      ? statuses.map((s) => statusBadge(s.status)).join(' ')
+      : '<span class="muted">aguardando status…</span>';
+    return '<div class="card">' +
+      '<div class="row"><strong>→ ' + esc(m.recipient) + '</strong>' +
+      '<span class="muted">' + fmtDate(m.sentAt) + '</span></div>' +
+      '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
+      '<div class="row">' + chain + '</div>' +
+      '<div class="actions" data-wamid="' + esc(m.providerMessageId) + '">' +
+      '<input data-role="correct-text" placeholder="texto corrigido…">' +
+      '<button data-action="correct">corrigir (⚠️ + reply)</button>' +
+      '<span class="muted feedback"></span>' +
+      '</div>' +
+      '<details data-key="out-' + m.id + '"><summary>detalhes + payloads</summary>' +
+      '<div class="label">wamid</div><pre>' + esc(m.providerMessageId) + '</pre>' +
+      '<div class="label">conteúdo enviado</div><pre>' + pretty(m.content) + '</pre>' +
+      '<div class="label">resposta da API</div><pre>' + pretty(m.apiResponse) + '</pre>' +
+      '<div class="label">timeline de status</div>' +
+      (statuses.length
+        ? '<ul class="timeline">' + statuses.map((s) =>
+            '<li>' + statusBadge(s.status) + ' <span class="muted">' + fmtDate(s.occurredAt) + '</span> ' +
+            wrLink(s.webhookRequestId) +
+            (s.error ? '<pre>' + pretty(s.error) + '</pre>' : '') +
+            '</li>').join('') + '</ul>'
+        : '<div class="muted">nenhum status recebido</div>') +
+      renderInteractions('reações', timeline ? timeline.reactions : []) +
+      renderInteractions('respostas (replies)', timeline ? timeline.replies : []) +
+      renderOutboundRefs('reações enviadas por nós', timeline ? timeline.outboundReactions : []) +
+      renderOutboundRefs('correções enviadas (replies nossos)', timeline ? timeline.outboundReplies : []) +
+      '</details></div>';
+  }).join('');
+}
+
+function renderInteractions(title, items) {
+  if (!items || !items.length) return '';
+  return '<div class="label">' + esc(title) + '</div><ul class="timeline">' +
+    items.map((m) =>
+      '<li>← <strong>' + esc(m.sender) + '</strong> ' + esc(contentSummary(m.content)) +
+      ' <span class="muted">' + fmtDate(m.receivedAt) + '</span> ' + wrLink(m.webhookRequestId) + '</li>'
+    ).join('') + '</ul>';
+}
+
+function renderOutboundRefs(title, items) {
+  if (!items || !items.length) return '';
+  return '<div class="label">' + esc(title) + '</div><ul class="timeline">' +
+    items.map((m) =>
+      '<li>→ ' + esc(contentSummary(m.content)) +
+      ' <span class="muted">' + fmtDate(m.sentAt) + '</span></li>'
+    ).join('') + '</ul>';
+}
+
+function renderInbound(messages) {
+  if (!messages.length) return '<div class="empty">nenhuma mensagem recebida ainda</div>';
+  return messages.map((m) =>
+    '<div class="card">' +
+    '<div class="row"><strong>← ' + esc(m.sender) + '</strong>' +
+    '<span class="muted">' + fmtDate(m.receivedAt) + '</span></div>' +
+    '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
+    (m.replyTo ? '<div class="row muted">↩ reply para ' + esc(m.replyTo.slice(0, 24)) + '…</div>' : '') +
+    '<div class="row">' + wrLink(m.webhookRequestId) + '</div>' +
+    '<div class="actions" data-wamid="' + esc(m.providerMessageId) + '" data-sender="' + esc(m.sender) + '">' +
+    '<button data-action="read">marcar lida</button>' +
+    '<button data-action="react">reagir 👍</button>' +
+    '<input data-role="reply-text" placeholder="responder citando…">' +
+    '<button data-action="reply">responder</button>' +
+    '<span class="muted feedback"></span>' +
+    '</div>' +
+    '<details data-key="in-' + m.id + '"><summary>detalhes + payloads</summary>' +
+    '<div class="label">wamid</div><pre>' + esc(m.providerMessageId) + '</pre>' +
+    '<div class="label">conteúdo traduzido (core)</div><pre>' + pretty(m.content) + '</pre>' +
+    '<div class="label">payload nativo (raw)</div><pre>' + pretty(m.raw) + '</pre>' +
+    '</details></div>'
+  ).join('');
+}
+
+function renderWebhooks(requests) {
+  if (!requests.length) return '<div class="empty">nenhuma request recebida ainda</div>';
+  return requests.map((r) =>
+    '<div class="card" id="wr-' + r.id + '">' +
+    '<div class="row"><strong>#' + r.id + '</strong>' +
+    '<span class="badge">' + esc(r.channel) + '</span>' +
+    '<span class="badge ' + (r.signatureValid ? 'sig-ok">assinatura ok' : 'sig-bad">assinatura inválida') + '</span>' +
+    '<span class="muted">' + fmtDate(r.receivedAt) + '</span></div>' +
+    '<details data-key="wr-' + r.id + '"><summary>headers + corpo bruto</summary>' +
+    '<div class="label">headers</div><pre>' + pretty(r.headers) + '</pre>' +
+    '<div class="label">corpo bruto</div><pre>' + pretty(r.body) + '</pre>' +
+    '</details></div>'
+  ).join('');
+}
+
+function typingReply() {
+  const active = document.activeElement;
+  return active && active.dataset && /-text$/.test(active.dataset.role || '');
+}
+
+async function load() {
+  // não re-renderiza enquanto o usuário digita uma resposta
+  if (typingReply()) return;
+  try {
+    const [outbound, inbound, webhooks] = await Promise.all([
+      fetchJson('/api/messages/outbound'),
+      fetchJson('/api/messages/inbound'),
+      fetchJson('/api/webhook-requests'),
+    ]);
+
+    const timelines = {};
+    await Promise.all(outbound.map(async (m) => {
+      try {
+        timelines[m.providerMessageId] =
+          await fetchJson('/api/messages/' + encodeURIComponent(m.providerMessageId) + '/timeline');
+      } catch { /* envio sem timeline ainda */ }
+    }));
+
+    const keys = openKeys();
+    $('#outbound').innerHTML = renderOutbound(outbound, timelines);
+    $('#inbound').innerHTML = renderInbound(inbound);
+    $('#webhooks').innerHTML = renderWebhooks(webhooks);
+    restoreOpen(keys);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+// clique em "request #N" abre e destaca a request bruta correspondente
+document.addEventListener('click', (event) => {
+  const link = event.target.closest('a.wr-link');
+  if (!link) return;
+  const card = document.getElementById('wr-' + link.dataset.wr);
+  if (!card) return;
+  event.preventDefault();
+  card.querySelector('details').open = true;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.add('highlight');
+  setTimeout(() => card.classList.remove('highlight'), 2000);
+});
+
+// ações de devolução sobre uma mensagem recebida: marcar lida, reagir, responder citando
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('.actions button[data-action]');
+  if (!button) return;
+  const actions = button.closest('.actions');
+  const wamid = actions.dataset.wamid;
+  const sender = actions.dataset.sender;
+  const feedback = actions.querySelector('.feedback');
+
+  const calls = {
+    read: () => fetch('/api/whatsapp/messages/' + encodeURIComponent(wamid) + '/read', { method: 'POST' }),
+    react: () => fetch('/api/whatsapp/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ to: sender, content: { kind: 'reaction', targetMessageId: wamid, emoji: '👍' } }),
+    }),
+    reply: () => {
+      const text = actions.querySelector('[data-role=reply-text]').value.trim();
+      if (!text) return Promise.reject(new Error('digite o texto da resposta'));
+      return fetch('/api/whatsapp/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ to: sender, content: { kind: 'text', text: text }, replyTo: wamid }),
+      });
+    },
+    correct: () => {
+      const text = actions.querySelector('[data-role=correct-text]').value.trim();
+      if (!text) return Promise.reject(new Error('digite o texto corrigido'));
+      return fetch('/api/whatsapp/messages/' + encodeURIComponent(wamid) + '/correct', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: text }),
+      });
+    },
+  };
+
+  feedback.textContent = '…';
+  try {
+    const res = await calls[button.dataset.action]();
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(res.status + ' ' + JSON.stringify(data));
+    }
+    feedback.textContent = 'ok ✓';
+    setTimeout(load, 800);
+  } catch (error) {
+    feedback.textContent = 'erro: ' + error.message;
+  }
+});
+
+$('#send-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = new FormData(event.target);
+  const result = $('#send-result');
+  result.textContent = 'enviando…';
+  try {
+    const res = await fetch('/api/whatsapp/send', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        to: form.get('to'),
+        content: { kind: 'text', text: form.get('text') },
+      }),
+    });
+    const data = await res.json();
+    result.textContent = res.ok
+      ? 'enviado — ' + data.providerMessageId
+      : 'erro ' + res.status + ' — ' + JSON.stringify(data);
+    if (res.ok) load();
+  } catch (error) {
+    result.textContent = 'falha: ' + error.message;
+  }
+});
+
+$('#refresh').addEventListener('click', load);
+setInterval(() => { if ($('#auto').checked) load(); }, 4000);
+load();
+</script>
+</body>
+</html>
