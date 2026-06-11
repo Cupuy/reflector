@@ -1,0 +1,25 @@
+# Dependências
+node_modules/
+
+# Build
+dist/
+*.tsbuildinfo
+
+# Banco local (SQLite + WAL)
+data/
+
+# Ambiente — nunca commitar segredos
+.env
+.env.local
+
+# Testes
+coverage/
+
+# Logs
+*.log
+
+# Configuração local do Claude Code
+.claude/settings.local.json
+
+# SO / editor
+.DS_Store

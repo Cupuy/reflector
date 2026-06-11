@@ -1,0 +1,45 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15550783881",
+              "phone_number_id": "106540352242922"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Rafael" },
+                "wa_id": "5511999998888"
+              }
+            ],
+            "messages": [
+              {
+                "from": "5511999998888",
+                "id": "wamid.BUTTONREPLY1==",
+                "timestamp": "1749600300",
+                "type": "interactive",
+                "context": {
+                  "from": "15550783881",
+                  "id": "wamid.HBgNNTUxMTk5OTk5ODg4OBUCABEYEjQ2N0ZBQTNGQkU2OEQxRkQzNQA="
+                },
+                "interactive": {
+                  "type": "button_reply",
+                  "button_reply": {
+                    "id": "confirm-order",
+                    "title": "Confirmar pedido"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
