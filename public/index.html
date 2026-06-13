@@ -198,14 +198,19 @@ function renderOutbound(messages, timelines) {
     const chain = statuses.length
       ? statuses.map((s) => statusBadge(s.status)).join(' ')
       : '<span class="muted">aguardando status…</span>';
+    const isDiscord = m.channel === 'discord';
     return '<div class="card">' +
       '<div class="row"><strong>→ ' + esc(m.recipient) + '</strong>' +
       '<span class="muted">' + fmtDate(m.sentAt) + '</span></div>' +
       '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
       '<div class="row">' + chain + '</div>' +
       '<div class="actions" data-wamid="' + esc(m.providerMessageId) + '" data-channel="' + esc(m.channel) + '">' +
-      '<input data-role="correct-text" placeholder="texto corrigido…">' +
-      '<button data-action="correct">corrigir (⚠️ + reply)</button>' +
+      (isDiscord
+        ? '<input data-role="edit-text" placeholder="editar conteúdo…">' +
+          '<button data-action="edit">editar</button>' +
+          '<button data-action="delete">deletar</button>'
+        : '<input data-role="correct-text" placeholder="texto corrigido…">' +
+          '<button data-action="correct">corrigir (⚠️ + reply)</button>') +
       '<span class="muted feedback"></span>' +
       '</div>' +
       '<details data-key="out-' + m.id + '"><summary>detalhes + payloads</summary>' +
@@ -248,15 +253,19 @@ function renderOutboundRefs(title, items) {
 
 function renderInbound(messages) {
   if (!messages.length) return '<div class="empty">nenhuma mensagem recebida ainda</div>';
-  return messages.map((m) =>
-    '<div class="card">' +
+  return messages.map((m) => {
+    const isDiscord = m.channel === 'discord';
+    // Para Discord: `to` de reply é o channelId (parte antes do ':' no providerMessageId)
+    // Para WhatsApp: `to` de reply é o sender (número de telefone)
+    const replyTo = isDiscord ? m.providerMessageId.split(':')[0] : m.sender;
+    return '<div class="card">' +
     '<div class="row"><strong>← ' + esc(m.sender) + '</strong>' +
     '<span class="muted">' + fmtDate(m.receivedAt) + '</span></div>' +
     '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
     (m.replyTo ? '<div class="row muted">↩ reply para ' + esc(m.replyTo.slice(0, 24)) + '…</div>' : '') +
     '<div class="row">' + wrLink(m.webhookRequestId) + '</div>' +
-    '<div class="actions" data-wamid="' + esc(m.providerMessageId) + '" data-sender="' + esc(m.sender) + '" data-channel="' + esc(m.channel) + '">' +
-    '<button data-action="read">marcar lida</button>' +
+    '<div class="actions" data-wamid="' + esc(m.providerMessageId) + '" data-sender="' + esc(m.sender) + '" data-channel="' + esc(m.channel) + '" data-to="' + esc(replyTo) + '">' +
+    (isDiscord ? '' : '<button data-action="read">marcar lida</button>') +
     '<button data-action="react">reagir 👍</button>' +
     '<input data-role="reply-text" placeholder="responder citando…">' +
     '<button data-action="reply">responder</button>' +
@@ -266,8 +275,8 @@ function renderInbound(messages) {
     '<div class="label">wamid</div><pre>' + esc(m.providerMessageId) + '</pre>' +
     '<div class="label">conteúdo traduzido (core)</div><pre>' + pretty(m.content) + '</pre>' +
     '<div class="label">payload nativo (raw)</div><pre>' + pretty(m.raw) + '</pre>' +
-    '</details></div>'
-  ).join('');
+    '</details></div>';
+  }).join('');
 }
 
 function renderWebhooks(requests) {
@@ -334,7 +343,7 @@ document.addEventListener('click', (event) => {
   setTimeout(() => card.classList.remove('highlight'), 2000);
 });
 
-// ações de devolução sobre uma mensagem: marcar lida, reagir, responder, corrigir
+// ações de devolução sobre uma mensagem: marcar lida, reagir, responder, corrigir, editar, deletar
 document.addEventListener('click', async (event) => {
   const button = event.target.closest('.actions button[data-action]');
   if (!button) return;
@@ -342,6 +351,8 @@ document.addEventListener('click', async (event) => {
   const wamid = actions.dataset.wamid;
   const sender = actions.dataset.sender;
   const channel = actions.dataset.channel;
+  // `to` para reply: channelId no Discord, sender no WhatsApp (pré-computado no render)
+  const to = actions.dataset.to ?? sender;
   const feedback = actions.querySelector('.feedback');
 
   const calls = {
@@ -349,7 +360,7 @@ document.addEventListener('click', async (event) => {
     react: () => fetch('/api/' + channel + '/send', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ to: sender, content: { kind: 'reaction', targetMessageId: wamid, emoji: '👍' } }),
+      body: JSON.stringify({ to, content: { kind: 'reaction', targetMessageId: wamid, emoji: '👍' } }),
     }),
     reply: () => {
       const text = actions.querySelector('[data-role=reply-text]').value.trim();
@@ -357,7 +368,7 @@ document.addEventListener('click', async (event) => {
       return fetch('/api/' + channel + '/send', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ to: sender, content: { kind: 'text', text }, replyTo: wamid }),
+        body: JSON.stringify({ to, content: { kind: 'text', text }, replyTo: wamid }),
       });
     },
     correct: () => {
@@ -369,6 +380,16 @@ document.addEventListener('click', async (event) => {
         body: JSON.stringify({ text }),
       });
     },
+    edit: () => {
+      const text = actions.querySelector('[data-role=edit-text]').value.trim();
+      if (!text) return Promise.reject(new Error('digite o texto editado'));
+      return fetch('/api/' + channel + '/messages/' + encodeURIComponent(wamid), {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+    },
+    delete: () => fetch('/api/' + channel + '/messages/' + encodeURIComponent(wamid), { method: 'DELETE' }),
   };
 
   feedback.textContent = '…';
