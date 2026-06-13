@@ -27,3 +27,49 @@ A Cloud API não tem endpoint para editar nem apagar mensagens já enviadas (o "
 ### 2026-06-10 — markAsRead não gera webhook
 
 `POST /messages` com `status: "read"` confirma leitura (tique azul no aparelho do remetente), mas a Meta não envia nenhum evento de confirmação — o efeito só é observável no cliente.
+
+---
+
+## Discord
+
+### 2026-06-13 — Modelo push invertido: Gateway WebSocket vs. webhook HTTP
+
+**Diferença fundamental:** o WhatsApp empurra eventos via HTTP POST ao nosso servidor. O Discord funciona ao contrário: **nós nos conectamos** ao Gateway dele via WebSocket e ficamos escutando. Os eventos chegam por essa conexão persistente, não por POST ao `/webhooks/discord`.
+
+Isso forçou uma extensão na interface `ChannelProvider` — métodos de lifecycle opcionais `start()` e `stop()` para providers que precisam de conexão ativa. Providers baseados em webhook puro (WhatsApp) não implementam esses métodos.
+
+**Implicação para a abstração:** o projeto oficial precisa decidir se suporta os dois modelos (push + pull) ou padroniza em um só. A opção `start/stop` na interface é mínima mas suficiente. Uma alternativa mais explícita seria uma interface separada `GatewayProvider extends ChannelProvider`.
+
+**Detalhe operacional:** eventos do Gateway são autenticados por TLS + bot token, sem HMAC no corpo. A coluna `signature_valid` do banco sempre fica `true` para eventos Gateway.
+
+### 2026-06-13 — providerMessageId composto (channelId:messageId)
+
+**Problema:** no WhatsApp, o `wamid` é globalmente único. No Discord, qualquer operação sobre uma mensagem (editar, deletar, reagir) exige dois IDs: `channel_id` + `message_id`. Sem o `channel_id`, a REST API não funciona.
+
+**Solução:** o provider Discord usa `"${channelId}:${messageId}"` como `providerMessageId` composto. Reações recebidas (que não têm ID próprio) usam `"rxn:${userId}:${channelId}:${messageId}:${emoji}"`.
+
+**Implicação para a abstração:** `providerMessageId` não pode ser assumido como um ID opaco e portável. Cada provider define sua estrutura interna. O projeto oficial deve tratar `providerMessageId` como uma string opaca que o próprio provider sabe como decompor.
+
+### 2026-06-13 — Interactions endpoint exige resposta síncrona (PING/PONG)
+
+**Problema:** o Discord verifica a URL do Interactions endpoint enviando um POST com `{ type: 1 }` (PING) e esperando uma resposta JSON `{ type: 1 }` (PONG) dentro de 3 segundos. O servidor atual envia `200 vazio` imediatamente e processa de forma assíncrona — isso quebra o handshake do Interactions.
+
+**Situação atual:** o Interactions endpoint não está ativo (usamos apenas o Gateway). Se precisarmos ativá-lo no futuro, o servidor precisará de um mecanismo para a resposta customizada por provider antes do auto-reply `200`.
+
+**Possíveis soluções:** (a) adicionar `webhookResponse?(body): { status; body } | null` à interface, chamado antes do send da resposta; (b) usar rota dedicada `/webhooks/discord/interactions` fora do handler genérico.
+
+### 2026-06-13 — Reações não têm ID próprio no Discord
+
+**Diferença de modelo:** no WhatsApp, uma reação chega como uma mensagem regular com `id` próprio. No Discord, `MESSAGE_REACTION_ADD` traz `(user_id, channel_id, message_id, emoji)` — sem ID de evento.
+
+Para deduplicação via `INSERT OR IGNORE`, foi necessário construir um ID sintético: `rxn:${userId}:${channelId}:${messageId}:${emoji}`. Isso funciona para dedup mas torna o ID ilegível e não operável.
+
+**Implicação para a abstração:** o tipo `InboundMessage` assume `providerMessageId` como identificador para operações subsequentes. Para reações sem ID nativo, esse campo vira chave artificial de dedup, não um handle de API.
+
+### 2026-06-13 — Endereço de envio é channel_id, não userId
+
+**Diferença de modelo:** no WhatsApp, `to` é um número de telefone (identificador do contato). No Discord, `to` é um `channel_id` — tanto para canais de servidor quanto para DMs. Para DMs, é necessário primeiro criar o canal de DM via `POST /users/@me/channels` passando o `userId` e obter o `channel_id` resultante.
+
+**Solução:** o reflector expõe `POST /api/discord/dm` com `{ userId }` para criar/recuperar o canal de DM e retornar o `channelId` para uso nos envios subsequentes.
+
+**Implicação para a abstração:** o campo `to` de `OutboundMessage` não tem semântica uniforme — cada canal usa seu próprio espaço de endereços. O projeto oficial pode precisar de uma camada de resolução de endereços por provider.
