@@ -49,4 +49,11 @@ export interface ChannelProvider {
    * Discord: servidores + canais de texto. WhatsApp: não implementa (destinatário é livre).
    */
   listDestinations?(): Promise<Array<{ id: string; label: string; group?: string }>>;
+
+  /**
+   * Opcional: providers que verificam via POST (ex.: Slack URL verification).
+   * Se retornar uma string não-nula, o servidor responde com ela de forma síncrona
+   * em vez do 200 vazio padrão — equivalente ao hub.challenge do WhatsApp, mas via POST.
+   */
+  handleWebhookChallenge?(body: unknown): string | null;
 }

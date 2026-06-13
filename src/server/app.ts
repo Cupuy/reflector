@@ -107,6 +107,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         return reply.code(401).send();
       }
 
+      // Resposta síncrona para verificações POST-based (ex.: Slack URL verification)
+      const challenge = provider.handleWebhookChallenge?.(request.body);
+      if (challenge !== null && challenge !== undefined) {
+        return reply.type('text/plain').send(challenge);
+      }
+
       await reply.code(200).send();
 
       try {

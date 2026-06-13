@@ -16,6 +16,10 @@ const envSchema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1).optional(),
   DISCORD_APPLICATION_ID: z.string().min(1).optional(),
   DISCORD_PUBLIC_KEY: z.string().min(1).optional(),
+
+  // Slack App — opcionais; se omitidos, o provider não é registrado
+  SLACK_BOT_TOKEN: z.string().min(1).optional(),
+  SLACK_SIGNING_SECRET: z.string().min(1).optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;

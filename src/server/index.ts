@@ -1,5 +1,6 @@
 import { loadConfig } from '../config.js';
 import { DiscordProvider } from '../providers/discord/provider.js';
+import { SlackProvider } from '../providers/slack/provider.js';
 import { WhatsAppProvider } from '../providers/whatsapp/provider.js';
 import type { ChannelProvider } from '../core/provider.js';
 import { SqliteStore } from '../store/sqlite.js';
@@ -28,6 +29,13 @@ if (
     botToken: config.DISCORD_BOT_TOKEN,
     applicationId: config.DISCORD_APPLICATION_ID,
     publicKey: config.DISCORD_PUBLIC_KEY,
+  });
+}
+
+if (config.SLACK_BOT_TOKEN !== undefined && config.SLACK_SIGNING_SECRET !== undefined) {
+  providers['slack'] = new SlackProvider({
+    botToken: config.SLACK_BOT_TOKEN,
+    signingSecret: config.SLACK_SIGNING_SECRET,
   });
 }
 
