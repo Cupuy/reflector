@@ -232,6 +232,19 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
+  // Lista destinos disponíveis para envio no canal (ex.: servidores/canais do Discord)
+  app.get<{ Params: { channel: string } }>(
+    '/api/:channel/destinations',
+    async (request, reply) => {
+      const provider = getProvider(request.params.channel);
+      if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
+      if (!provider.listDestinations) {
+        return reply.code(405).send({ error: 'canal não suporta listagem de destinos' });
+      }
+      return provider.listDestinations();
+    },
+  );
+
   // Helper: criar canal de DM no Discord a partir de um userId
   app.post<{ Params: { channel: string } }>(
     '/api/:channel/dm',
@@ -264,9 +277,27 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  app.get('/api/messages/outbound', async () => store.listOutbound());
-  app.get('/api/messages/inbound', async () => store.listInbound());
-  app.get('/api/webhook-requests', async () => store.listWebhookRequests());
+  app.get('/api/messages/outbound', async (request) => {
+    const { before, limit } = request.query as { before?: string; limit?: string };
+    return store.listOutbound({
+      ...(limit ? { limit: Math.min(parseInt(limit, 10), 200) } : {}),
+      ...(before ? { before: parseInt(before, 10) } : {}),
+    });
+  });
+  app.get('/api/messages/inbound', async (request) => {
+    const { before, limit } = request.query as { before?: string; limit?: string };
+    return store.listInbound({
+      ...(limit ? { limit: Math.min(parseInt(limit, 10), 200) } : {}),
+      ...(before ? { before: parseInt(before, 10) } : {}),
+    });
+  });
+  app.get('/api/webhook-requests', async (request) => {
+    const { before, limit } = request.query as { before?: string; limit?: string };
+    return store.listWebhookRequests({
+      ...(limit ? { limit: Math.min(parseInt(limit, 10), 200) } : {}),
+      ...(before ? { before: parseInt(before, 10) } : {}),
+    });
+  });
 
   return app;
 }
