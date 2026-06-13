@@ -1,4 +1,11 @@
+import type { MessageStore } from './store.js';
 import type { ChannelId, InboundEvent, OutboundMessage, SendResult } from './types.js';
+
+export interface Logger {
+  info(msg: string, data?: object): void;
+  warn(msg: string, data?: object): void;
+  error(msg: string, data?: object): void;
+}
 
 export interface ChannelProvider {
   readonly channel: ChannelId;
@@ -21,4 +28,19 @@ export interface ChannelProvider {
 
   /** Traduz o payload nativo do webhook em eventos agnósticos de canal. */
   parseWebhook(body: unknown): InboundEvent[];
+
+  /**
+   * Opcional: providers que precisam de conexão persistente (ex.: Discord Gateway WebSocket)
+   * chamam start() na inicialização para se conectar ao canal.
+   */
+  start?(context: { store: MessageStore; log: Logger }): Promise<void>;
+
+  /** Para a conexão persistente iniciada por start(). */
+  stop?(): Promise<void>;
+
+  /** Opcional: canais que permitem edição de mensagens enviadas (ex.: Discord, Telegram). */
+  editMessage?(providerMessageId: string, text: string): Promise<void>;
+
+  /** Opcional: canais que permitem exclusão de mensagens (ex.: Discord, Telegram). */
+  deleteMessage?(providerMessageId: string): Promise<void>;
 }

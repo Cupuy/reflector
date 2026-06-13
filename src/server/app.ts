@@ -4,6 +4,7 @@ import rawBody from 'fastify-raw-body';
 import { z } from 'zod';
 import type { ChannelProvider } from '../core/provider.js';
 import type { MessageStore } from '../core/store.js';
+import type { DiscordProvider } from '../providers/discord/provider.js';
 
 export interface AppOptions {
   providers: Record<string, ChannelProvider>;
@@ -45,7 +46,27 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   const getProvider = (channel: string): ChannelProvider | undefined => providers[channel];
 
-  // Dashboard de inspeção: timeline de envios, payloads e requests brutas
+  // Inicia conexões persistentes dos providers que precisam (ex.: Discord Gateway)
+  for (const provider of Object.values(providers)) {
+    if (provider.start) {
+      await provider.start({
+        store,
+        log: {
+          info: (msg, data) => app.log.info(data ?? {}, msg),
+          warn: (msg, data) => app.log.warn(data ?? {}, msg),
+          error: (msg, data) => app.log.error(data ?? {}, msg),
+        },
+      });
+    }
+  }
+
+  app.addHook('onClose', async () => {
+    for (const provider of Object.values(providers)) {
+      await provider.stop?.();
+    }
+  });
+
+  // Dashboard de inspeção
   app.get('/', async (_request, reply) => {
     const html = await readFile(new URL('../../public/index.html', import.meta.url), 'utf8');
     return reply.type('text/html; charset=utf-8').send(html);
@@ -58,7 +79,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
     const challenge = provider.handleVerification(request.query as Record<string, unknown>);
     if (challenge === null) {
-      request.log.warn('verificação de webhook recusada: verify token não confere');
+      request.log.warn('verificação de webhook recusada');
       return reply.code(403).send('Forbidden');
     }
     return reply.type('text/plain').send(challenge);
@@ -74,7 +95,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       const raw = request.rawBody ?? '';
       const signatureValid = provider.verifySignature(raw, request.headers);
 
-      // Persiste TODA request recebida, válida ou não — é a matéria-prima do laboratório
       const webhookRequestId = store.saveWebhookRequest({
         channel: provider.channel,
         headers: request.headers,
@@ -87,7 +107,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         return reply.code(401).send();
       }
 
-      // 200 imediato; a Meta reenvia eventos sem ack e o processamento não deve atrasar isso
       await reply.code(200).send();
 
       try {
@@ -110,6 +129,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
+  // Envio de mensagem
   app.post<{ Params: { channel: string } }>('/api/:channel/send', async (request, reply) => {
     const provider = getProvider(request.params.channel);
     if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
@@ -125,6 +145,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     return reply.code(201).send({ providerMessageId: result.providerMessageId, raw: result.raw });
   });
 
+  // Confirma leitura de mensagem recebida
   app.post<{ Params: { channel: string; providerMessageId: string } }>(
     '/api/:channel/messages/:providerMessageId/read',
     async (request, reply) => {
@@ -136,8 +157,42 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  // Padrão de correção pós-envio: a Cloud API não permite editar mensagem enviada,
-  // então sinalizamos a original com ⚠️ e enviamos um reply citando-a com o texto corrigido
+  // Edição de mensagem enviada (ex.: Discord, Telegram)
+  app.patch<{ Params: { channel: string; providerMessageId: string } }>(
+    '/api/:channel/messages/:providerMessageId',
+    async (request, reply) => {
+      const provider = getProvider(request.params.channel);
+      if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
+      if (!provider.editMessage) {
+        return reply.code(405).send({ error: `canal ${request.params.channel} não suporta edição` });
+      }
+
+      const parsed = z.object({ text: z.string().min(1) }).safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'payload inválido', issues: parsed.error.issues });
+      }
+
+      await provider.editMessage(request.params.providerMessageId, parsed.data.text);
+      return { ok: true };
+    },
+  );
+
+  // Exclusão de mensagem enviada (ex.: Discord, Telegram)
+  app.delete<{ Params: { channel: string; providerMessageId: string } }>(
+    '/api/:channel/messages/:providerMessageId',
+    async (request, reply) => {
+      const provider = getProvider(request.params.channel);
+      if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
+      if (!provider.deleteMessage) {
+        return reply.code(405).send({ error: `canal ${request.params.channel} não suporta exclusão` });
+      }
+
+      await provider.deleteMessage(request.params.providerMessageId);
+      return reply.code(204).send();
+    },
+  );
+
+  // Padrão de correção pós-envio do WhatsApp: reação ⚠️ + reply com texto corrigido
   app.post<{ Params: { channel: string; providerMessageId: string } }>(
     '/api/:channel/messages/:providerMessageId/correct',
     async (request, reply) => {
@@ -177,7 +232,29 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  // Correlação: mensagem enviada + status recebidos via webhook (cada um aponta o webhook_request de origem)
+  // Helper: criar canal de DM no Discord a partir de um userId
+  app.post<{ Params: { channel: string } }>(
+    '/api/:channel/dm',
+    async (request, reply) => {
+      const provider = getProvider(request.params.channel);
+      if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
+
+      const discordProvider = provider as Partial<Pick<DiscordProvider, 'createDMChannel'>>;
+      if (typeof discordProvider.createDMChannel !== 'function') {
+        return reply.code(405).send({ error: 'canal não suporta criação de DM via API' });
+      }
+
+      const parsed = z.object({ userId: z.string().min(1) }).safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'payload inválido', issues: parsed.error.issues });
+      }
+
+      const channelId = await discordProvider.createDMChannel(parsed.data.userId);
+      return { channelId };
+    },
+  );
+
+  // Correlação: mensagem enviada + status recebidos + interações
   app.get<{ Params: { providerMessageId: string } }>(
     '/api/messages/:providerMessageId/timeline',
     async (request, reply) => {

@@ -1,5 +1,7 @@
 import { loadConfig } from '../config.js';
+import { DiscordProvider } from '../providers/discord/provider.js';
 import { WhatsAppProvider } from '../providers/whatsapp/provider.js';
+import type { ChannelProvider } from '../core/provider.js';
 import { SqliteStore } from '../store/sqlite.js';
 import { buildApp } from './app.js';
 
@@ -15,6 +17,20 @@ const whatsapp = new WhatsAppProvider({
   apiVersion: config.WHATSAPP_API_VERSION,
 });
 
-const app = await buildApp({ providers: { whatsapp }, store });
+const providers: Record<string, ChannelProvider> = { whatsapp };
+
+if (
+  config.DISCORD_BOT_TOKEN !== undefined &&
+  config.DISCORD_APPLICATION_ID !== undefined &&
+  config.DISCORD_PUBLIC_KEY !== undefined
+) {
+  providers['discord'] = new DiscordProvider({
+    botToken: config.DISCORD_BOT_TOKEN,
+    applicationId: config.DISCORD_APPLICATION_ID,
+    publicKey: config.DISCORD_PUBLIC_KEY,
+  });
+}
+
+const app = await buildApp({ providers, store });
 
 await app.listen({ port: config.PORT, host: '0.0.0.0' });
