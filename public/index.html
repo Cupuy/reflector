@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1419; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
     --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; --err: #f85149;
-    --ch-whatsapp: #25d366; --ch-teams: #7b83eb;
+    --ch-whatsapp: #25d366; --ch-discord: #5865f2; --ch-teams: #7b83eb; --ch-slack: #e01e5a;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
@@ -24,7 +24,9 @@
   nav.channels .tab.active { font-weight: 600; }
   nav.channels .tab[data-channel=""].active { border-color: var(--muted); color: var(--muted); }
   nav.channels .tab[data-channel="whatsapp"].active { border-color: var(--ch-whatsapp); color: var(--ch-whatsapp); }
+  nav.channels .tab[data-channel="discord"].active { border-color: var(--ch-discord); color: var(--ch-discord); }
   nav.channels .tab[data-channel="teams"].active { border-color: var(--ch-teams); color: var(--ch-teams); }
+  nav.channels .tab[data-channel="slack"].active { border-color: var(--ch-slack); color: var(--ch-slack); }
   main { display: grid; gap: 16px; padding: 16px 20px; align-items: start; }
   main.all-channels { grid-template-columns: 1fr; }
   main.single-channel { grid-template-columns: 1fr 1fr 1fr; }
@@ -42,7 +44,9 @@
   .badge.sig-ok { color: var(--ok); border-color: var(--ok); }
   .badge.sig-bad { color: var(--err); border-color: var(--err); }
   .badge.ch-whatsapp { color: var(--ch-whatsapp); border-color: var(--ch-whatsapp); }
+  .badge.ch-discord { color: var(--ch-discord); border-color: var(--ch-discord); }
   .badge.ch-teams { color: var(--ch-teams); border-color: var(--ch-teams); }
+  .badge.ch-slack { color: var(--ch-slack); border-color: var(--ch-slack); }
   details { margin-top: 8px; }
   summary { cursor: pointer; color: var(--accent); font-size: 12px; }
   pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; max-height: 320px; }
@@ -55,6 +59,8 @@
   form.send { display: flex; gap: 8px; padding: 0 20px 4px; flex-wrap: wrap; align-items: center; }
   form.send input { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; }
   form.send input[name=text] { flex: 1; min-width: 200px; }
+  form.send select { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; min-width: 220px; max-width: 340px; }
+  form.send select:focus { outline: none; border-color: var(--accent); }
   form.send.disabled { opacity: 0.4; pointer-events: none; }
   .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
   .actions button { padding: 2px 10px; font-size: 12px; }
@@ -62,6 +68,7 @@
   .actions .feedback { font-size: 11px; }
   #send-result { padding: 0 20px 8px; font-size: 12px; color: var(--muted); word-break: break-all; }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .sentinel { text-align: center; padding: 12px 0; color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -70,7 +77,9 @@
   <nav class="channels" id="channel-tabs">
     <button class="tab active" data-channel="">todos</button>
     <button class="tab" data-channel="whatsapp">whatsapp</button>
+    <button class="tab" data-channel="discord">discord</button>
     <button class="tab" data-channel="teams">teams</button>
+    <button class="tab" data-channel="slack">slack</button>
   </nav>
   <div class="spacer"></div>
   <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh (4s)</label>
@@ -78,7 +87,8 @@
 </header>
 
 <form class="send disabled" id="send-form">
-  <input name="to" placeholder="destinatário" required>
+  <input id="to-input" name="to" placeholder="destinatário" required>
+  <select id="to-select" hidden></select>
   <input name="text" placeholder="mensagem de texto" required>
   <button type="submit" id="send-btn">selecione um canal para enviar</button>
 </form>
@@ -87,15 +97,21 @@
 <main class="all-channels" id="main">
   <section id="section-outbound" hidden>
     <h2>Enviadas (API → canal)</h2>
-    <div id="outbound"></div>
+    <div id="outbound-fresh"></div>
+    <div id="outbound-history"></div>
+    <div id="outbound-sentinel" class="sentinel" hidden>↓ carregar mais</div>
   </section>
   <section id="section-inbound" hidden>
     <h2>Recebidas (canal → webhook)</h2>
-    <div id="inbound"></div>
+    <div id="inbound-fresh"></div>
+    <div id="inbound-history"></div>
+    <div id="inbound-sentinel" class="sentinel" hidden>↓ carregar mais</div>
   </section>
   <section>
     <h2>Webhook requests (brutas)</h2>
-    <div id="webhooks"></div>
+    <div id="webhooks-fresh"></div>
+    <div id="webhooks-history"></div>
+    <div id="webhooks-sentinel" class="sentinel" hidden>↓ carregar mais</div>
   </section>
 </main>
 
@@ -103,6 +119,76 @@
 const $ = (sel) => document.querySelector(sel);
 
 let activeChannel = ''; // '' = todos os canais
+
+const PAGE_SIZE = 50;
+const pager = {
+  outbound: { minId: null, exhausted: false, loading: false },
+  inbound:  { minId: null, exhausted: false, loading: false },
+  webhooks: { minId: null, exhausted: false, loading: false },
+};
+
+function resetPager() {
+  for (const s of Object.keys(pager)) {
+    pager[s] = { minId: null, exhausted: false, loading: false };
+    const h = document.getElementById(s + '-history');
+    if (h) h.innerHTML = '';
+  }
+  updateSentinels();
+}
+
+function updateSentinels() {
+  for (const s of Object.keys(pager)) {
+    const el = document.getElementById(s + '-sentinel');
+    if (!el) continue;
+    el.hidden = pager[s].exhausted || pager[s].minId === null;
+    if (!el.hidden && !pager[s].loading) el.textContent = '↓ carregar mais';
+  }
+}
+
+async function loadMore(section) {
+  const state = pager[section];
+  if (state.loading || state.exhausted || state.minId === null) return;
+  state.loading = true;
+  const sentinel = document.getElementById(section + '-sentinel');
+  if (sentinel) sentinel.textContent = 'carregando…';
+  try {
+    const qs = '?before=' + state.minId + '&limit=' + PAGE_SIZE;
+    const histEl = document.getElementById(section + '-history');
+    let html = '';
+    let raw = [];
+    if (section === 'outbound') {
+      const messages = await fetchJson('/api/messages/outbound' + qs);
+      raw = messages;
+      const filtered = activeChannel ? messages.filter((m) => m.channel === activeChannel) : messages;
+      const timelines = {};
+      await Promise.all(filtered.map(async (m) => {
+        try {
+          timelines[m.providerMessageId] =
+            await fetchJson('/api/messages/' + encodeURIComponent(m.providerMessageId) + '/timeline');
+        } catch { /**/ }
+      }));
+      html = filtered.length ? renderOutbound(filtered, timelines) : '';
+    } else if (section === 'inbound') {
+      const messages = await fetchJson('/api/messages/inbound' + qs);
+      raw = messages;
+      const filtered = activeChannel ? messages.filter((m) => m.channel === activeChannel) : messages;
+      html = filtered.length ? renderInbound(filtered) : '';
+    } else {
+      const requests = await fetchJson('/api/webhook-requests' + qs);
+      raw = requests;
+      const filtered = activeChannel ? requests.filter((r) => r.channel === activeChannel) : requests;
+      html = filtered.length ? renderWebhooks(filtered) : '';
+    }
+    if (raw.length) state.minId = Math.min(...raw.map((r) => r.id));
+    if (raw.length < PAGE_SIZE) state.exhausted = true;
+    if (html && histEl) histEl.insertAdjacentHTML('beforeend', html);
+  } catch (err) {
+    console.error('loadMore', section, err);
+  } finally {
+    state.loading = false;
+    updateSentinels();
+  }
+}
 
 function esc(value) {
   return String(value).replace(/[&<>"']/g, (c) =>
@@ -161,10 +247,44 @@ async function fetchJson(url) {
   return res.json();
 }
 
+async function loadDestinations(channel) {
+  const select = $('#to-select');
+  select.innerHTML = '<option value="">carregando canais…</option>';
+  try {
+    const destinations = await fetchJson('/api/' + channel + '/destinations');
+    select.innerHTML = '';
+    // Agrupa por guild usando <optgroup>
+    const groups = {};
+    for (const d of destinations) {
+      const g = d.group ?? '';
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(d);
+    }
+    for (const [groupName, items] of Object.entries(groups)) {
+      const grp = document.createElement('optgroup');
+      grp.label = groupName;
+      for (const item of items) {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        opt.textContent = item.label;
+        grp.appendChild(opt);
+      }
+      select.appendChild(grp);
+    }
+    if (!select.options.length) {
+      select.innerHTML = '<option value="">(nenhum canal encontrado)</option>';
+    }
+  } catch {
+    select.innerHTML = '<option value="">(erro ao carregar canais)</option>';
+  }
+}
+
 function updateUI() {
   const main = $('#main');
   const sendForm = $('#send-form');
   const sendBtn = $('#send-btn');
+  const toInput = $('#to-input');
+  const toSelect = $('#to-select');
 
   if (activeChannel) {
     main.className = 'single-channel';
@@ -172,12 +292,23 @@ function updateUI() {
     $('#section-inbound').hidden = false;
     sendForm.classList.remove('disabled');
     sendBtn.textContent = 'enviar via ' + activeChannel;
+
+    // Canais com seletor de destino mostram <select>; outros mostram <input>
+    // Discord e Slack têm listagem de canais via API; WhatsApp/Teams usam destinatário livre
+    const hasDestinations = activeChannel === 'discord' || activeChannel === 'slack';
+    toInput.hidden = hasDestinations;
+    toInput.required = !hasDestinations;
+    toSelect.hidden = !hasDestinations;
+    if (hasDestinations) loadDestinations(activeChannel);
   } else {
     main.className = 'all-channels';
     $('#section-outbound').hidden = true;
     $('#section-inbound').hidden = true;
     sendForm.classList.add('disabled');
     sendBtn.textContent = 'selecione um canal para enviar';
+    toInput.hidden = false;
+    toInput.required = true;
+    toSelect.hidden = true;
   }
 }
 
@@ -187,6 +318,7 @@ $('#channel-tabs').addEventListener('click', (e) => {
   activeChannel = tab.dataset.channel;
   document.querySelectorAll('#channel-tabs .tab').forEach((t) => t.classList.toggle('active', t === tab));
   updateUI();
+  resetPager();
   load();
 });
 
@@ -321,10 +453,24 @@ async function load() {
     }));
 
     const keys = openKeys();
-    $('#outbound').innerHTML = renderOutbound(filteredOutbound, timelines);
-    $('#inbound').innerHTML = renderInbound(filteredInbound);
-    $('#webhooks').innerHTML = renderWebhooks(filteredWebhooks);
+    $('#outbound-fresh').innerHTML = renderOutbound(filteredOutbound, timelines);
+    $('#inbound-fresh').innerHTML = renderInbound(filteredInbound);
+    $('#webhooks-fresh').innerHTML = renderWebhooks(filteredWebhooks);
     restoreOpen(keys);
+
+    if (outbound.length && pager.outbound.minId === null) {
+      pager.outbound.minId = Math.min(...outbound.map((m) => m.id));
+      if (outbound.length < PAGE_SIZE) pager.outbound.exhausted = true;
+    }
+    if (inbound.length && pager.inbound.minId === null) {
+      pager.inbound.minId = Math.min(...inbound.map((m) => m.id));
+      if (inbound.length < PAGE_SIZE) pager.inbound.exhausted = true;
+    }
+    if (webhooks.length && pager.webhooks.minId === null) {
+      pager.webhooks.minId = Math.min(...webhooks.map((r) => r.id));
+      if (webhooks.length < PAGE_SIZE) pager.webhooks.exhausted = true;
+    }
+    updateSentinels();
   } catch (error) {
     console.error(error);
   }
@@ -410,6 +556,9 @@ $('#send-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!activeChannel) return;
   const form = new FormData(event.target);
+  // Para canais com seletor de destino, o `to` vem do <select>; para os outros, do <input>
+  const to = $('#to-select').hidden ? form.get('to') : $('#to-select').value;
+  if (!to) { $('#send-result').textContent = 'selecione um canal de destino'; return; }
   const result = $('#send-result');
   result.textContent = 'enviando…';
   try {
@@ -417,7 +566,7 @@ $('#send-form').addEventListener('submit', async (event) => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        to: form.get('to'),
+        to,
         content: { kind: 'text', text: form.get('text') },
       }),
     });
@@ -430,6 +579,16 @@ $('#send-form').addEventListener('submit', async (event) => {
     result.textContent = 'falha: ' + error.message;
   }
 });
+
+const _observer = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    loadMore(entry.target.id.replace('-sentinel', ''));
+  }
+}, { rootMargin: '100px' });
+for (const s of ['outbound', 'inbound', 'webhooks']) {
+  _observer.observe(document.getElementById(s + '-sentinel'));
+}
 
 $('#refresh').addEventListener('click', load);
 setInterval(() => { if ($('#auto').checked) load(); }, 4000);
