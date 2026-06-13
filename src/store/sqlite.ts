@@ -198,24 +198,27 @@ export class SqliteStore implements MessageStore {
     };
   }
 
-  listOutbound(limit = 50): OutboundRecord[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM outbound_messages ORDER BY id DESC LIMIT ?`)
-      .all(limit) as OutboundRow[];
+  listOutbound({ limit = 50, before }: { limit?: number; before?: number } = {}): OutboundRecord[] {
+    const rows = (before !== undefined
+      ? this.db.prepare(`SELECT * FROM outbound_messages WHERE id < ? ORDER BY id DESC LIMIT ?`).all(before, limit)
+      : this.db.prepare(`SELECT * FROM outbound_messages ORDER BY id DESC LIMIT ?`).all(limit)
+    ) as OutboundRow[];
     return rows.map(toOutboundRecord);
   }
 
-  listInbound(limit = 50): InboundRecord[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM inbound_messages ORDER BY id DESC LIMIT ?`)
-      .all(limit) as InboundRow[];
+  listInbound({ limit = 50, before }: { limit?: number; before?: number } = {}): InboundRecord[] {
+    const rows = (before !== undefined
+      ? this.db.prepare(`SELECT * FROM inbound_messages WHERE id < ? ORDER BY id DESC LIMIT ?`).all(before, limit)
+      : this.db.prepare(`SELECT * FROM inbound_messages ORDER BY id DESC LIMIT ?`).all(limit)
+    ) as InboundRow[];
     return rows.map(toInboundRecord);
   }
 
-  listWebhookRequests(limit = 50): WebhookRequestRecord[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM webhook_requests ORDER BY id DESC LIMIT ?`)
-      .all(limit) as WebhookRequestRow[];
+  listWebhookRequests({ limit = 50, before }: { limit?: number; before?: number } = {}): WebhookRequestRecord[] {
+    const rows = (before !== undefined
+      ? this.db.prepare(`SELECT * FROM webhook_requests WHERE id < ? ORDER BY id DESC LIMIT ?`).all(before, limit)
+      : this.db.prepare(`SELECT * FROM webhook_requests ORDER BY id DESC LIMIT ?`).all(limit)
+    ) as WebhookRequestRow[];
     return rows.map((row) => ({
       id: row.id,
       channel: row.channel,
