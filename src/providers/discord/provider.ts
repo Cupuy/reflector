@@ -93,7 +93,12 @@ export class DiscordProvider implements ChannelProvider {
       return { providerMessageId: syntheticId, raw: { ok: true } };
     }
 
-    const channelId = message.to; // para Discord, `to` é sempre um channel_id
+    // `dm:<userId>` indica envio privado — abre (ou obtém) o canal de DM antes de enviar
+    let channelId = message.to;
+    if (channelId.startsWith('dm:')) {
+      channelId = await this.createDMChannel(channelId.slice(3));
+    }
+
     const body = this.toMessagePayload(message);
     const raw = await this.rest<{ id: string }>('POST', `/channels/${channelId}/messages`, body);
 
@@ -114,6 +119,49 @@ export class DiscordProvider implements ChannelProvider {
   async deleteMessage(providerMessageId: string): Promise<void> {
     const [channelId, messageId] = splitCompositeId(providerMessageId);
     await this.rest('DELETE', `/channels/${channelId}/messages/${messageId}`);
+  }
+
+  // ── Destinos disponíveis (servidores + canais de texto) ────────────────────
+
+  async listDestinations(): Promise<Array<{ id: string; label: string; group?: string }>> {
+    const guilds = await this.rest<Array<{ id: string; name: string }>>('GET', '/users/@me/guilds');
+
+    const results: Array<{ id: string; label: string; group: string }> = [];
+
+    await Promise.all(
+      guilds.map(async (guild) => {
+        const [channelsDone, membersDone] = await Promise.allSettled([
+          this.rest<Array<{ id: string; name: string; type: number; position: number }>>(
+            'GET',
+            `/guilds/${guild.id}/channels`,
+          ).then((channels) =>
+            // type 0 = GUILD_TEXT, type 5 = GUILD_ANNOUNCEMENT
+            channels
+              .filter((c) => c.type === 0 || c.type === 5)
+              .sort((a, b) => a.position - b.position)
+              .forEach((c) => results.push({ id: c.id, label: `#${c.name}`, group: guild.name })),
+          ),
+
+          this.rest<Array<{ user: { id: string; username: string } }>>(
+            'GET',
+            `/guilds/${guild.id}/members?limit=1000`,
+          ).then((members) =>
+            members.forEach((m) =>
+              results.push({
+                id: `dm:${m.user.id}`,
+                label: `@${m.user.username}`,
+                group: `${guild.name} — DMs`,
+              }),
+            ),
+          ),
+        ]);
+
+        if (channelsDone.status === 'rejected') { /* permissões insuficientes — ignora */ }
+        if (membersDone.status === 'rejected') { /* intent GUILD_MEMBERS não habilitada — ignora */ }
+      }),
+    );
+
+    return results;
   }
 
   // ── Helper: criar canal de DM a partir de um userId ─────────────────────────

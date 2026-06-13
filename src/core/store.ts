@@ -74,7 +74,7 @@ export interface MessageStore {
 
   getMessageTimeline(providerMessageId: string): MessageTimeline | null;
 
-  listOutbound(limit?: number): OutboundRecord[];
-  listInbound(limit?: number): InboundRecord[];
-  listWebhookRequests(limit?: number): WebhookRequestRecord[];
+  listOutbound(opts?: { limit?: number; before?: number }): OutboundRecord[];
+  listInbound(opts?: { limit?: number; before?: number }): InboundRecord[];
+  listWebhookRequests(opts?: { limit?: number; before?: number }): WebhookRequestRecord[];
 }

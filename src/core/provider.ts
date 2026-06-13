@@ -43,4 +43,10 @@ export interface ChannelProvider {
 
   /** Opcional: canais que permitem exclusão de mensagens (ex.: Discord, Telegram). */
   deleteMessage?(providerMessageId: string): Promise<void>;
+
+  /**
+   * Opcional: retorna os destinos disponíveis para envio neste canal.
+   * Discord: servidores + canais de texto. WhatsApp: não implementa (destinatário é livre).
+   */
+  listDestinations?(): Promise<Array<{ id: string; label: string; group?: string }>>;
 }
