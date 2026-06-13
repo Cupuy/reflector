@@ -4,7 +4,6 @@ import rawBody from 'fastify-raw-body';
 import { z } from 'zod';
 import type { ChannelProvider } from '../core/provider.js';
 import type { MessageStore } from '../core/store.js';
-import type { DiscordProvider } from '../providers/discord/provider.js';
 
 export interface AppOptions {
   providers: Record<string, ChannelProvider>;
@@ -198,7 +197,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  // Padrão de correção pós-envio do WhatsApp: reação ⚠️ + reply com texto corrigido
+  // Correção de mensagem enviada:
+  // - canais com edição nativa (Slack, Discord): edita a mensagem diretamente
+  // - canais sem edição (WhatsApp): padrão reação ⚠️ + reply com texto corrigido
   app.post<{ Params: { channel: string; providerMessageId: string } }>(
     '/api/:channel/messages/:providerMessageId/correct',
     async (request, reply) => {
@@ -210,15 +211,21 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         return reply.code(400).send({ error: 'payload inválido', issues: parsed.error.issues });
       }
 
-      const wamid = request.params.providerMessageId;
-      const timeline = store.getMessageTimeline(wamid);
+      const messageId = request.params.providerMessageId;
+      const timeline = store.getMessageTimeline(messageId);
       if (!timeline) return reply.code(404).send({ error: 'mensagem enviada não encontrada' });
 
+      if (provider.editMessage) {
+        await provider.editMessage(messageId, parsed.data.text);
+        return reply.code(200).send({ edited: true });
+      }
+
+      // Fallback: padrão WhatsApp (canal não suporta edição)
       const to = timeline.outbound.recipient;
 
       const reactionMessage = {
         to,
-        content: { kind: 'reaction', targetMessageId: wamid, emoji: '⚠️' },
+        content: { kind: 'reaction', targetMessageId: messageId, emoji: '⚠️' },
       } as const;
       const reactionResult = await provider.send(reactionMessage);
       store.saveOutbound({ channel: provider.channel, message: reactionMessage, result: reactionResult });
@@ -226,7 +233,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       const correctionMessage = {
         to,
         content: { kind: 'text', text: parsed.data.text },
-        replyTo: wamid,
+        replyTo: messageId,
       } as const;
       const correctionResult = await provider.send(correctionMessage);
       store.saveOutbound({ channel: provider.channel, message: correctionMessage, result: correctionResult });
@@ -251,16 +258,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  // Helper: criar canal de DM no Discord a partir de um userId
+  // Abre (ou recupera) canal de DM com um usuário — Discord e Slack
   app.post<{ Params: { channel: string } }>(
     '/api/:channel/dm',
     async (request, reply) => {
       const provider = getProvider(request.params.channel);
       if (!provider) return reply.code(404).send({ error: 'canal desconhecido' });
-
-      const discordProvider = provider as Partial<Pick<DiscordProvider, 'createDMChannel'>>;
-      if (typeof discordProvider.createDMChannel !== 'function') {
-        return reply.code(405).send({ error: 'canal não suporta criação de DM via API' });
+      if (!provider.openDM) {
+        return reply.code(405).send({ error: 'canal não suporta abertura de DM via API' });
       }
 
       const parsed = z.object({ userId: z.string().min(1) }).safeParse(request.body);
@@ -268,7 +273,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         return reply.code(400).send({ error: 'payload inválido', issues: parsed.error.issues });
       }
 
-      const channelId = await discordProvider.createDMChannel(parsed.data.userId);
+      const channelId = await provider.openDM(parsed.data.userId);
       return { channelId };
     },
   );

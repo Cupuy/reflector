@@ -164,7 +164,11 @@ export class DiscordProvider implements ChannelProvider {
     return results;
   }
 
-  // ── Helper: criar canal de DM a partir de um userId ─────────────────────────
+  // ── DM ───────────────────────────────────────────────────────────────────────
+
+  async openDM(userId: string): Promise<string> {
+    return this.createDMChannel(userId);
+  }
 
   async createDMChannel(userId: string): Promise<string> {
     const raw = await this.rest<{ id: string }>('POST', '/users/@me/channels', {

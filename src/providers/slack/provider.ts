@@ -149,9 +149,8 @@ export class SlackProvider implements ChannelProvider {
     return { providerMessageId: `${raw.channel}:${raw.ts}`, raw };
   }
 
-  async markAsRead(providerMessageId: string): Promise<void> {
-    const [channel, ts] = splitCompositeId(providerMessageId);
-    await this.api('conversations.mark', { channel, ts });
+  async markAsRead(_providerMessageId: string): Promise<void> {
+    // conversations.mark só funciona com tokens de usuário — bots não têm estado de "lido"
   }
 
   // ── Edição e exclusão ──────────────────────────────────────────────────────
@@ -167,6 +166,11 @@ export class SlackProvider implements ChannelProvider {
   }
 
   // ── Destinos disponíveis ───────────────────────────────────────────────────
+
+  async openDM(userId: string): Promise<string> {
+    const raw = await this.api<{ channel: { id: string } }>('conversations.open', { users: userId });
+    return raw.channel.id;
+  }
 
   async listDestinations(): Promise<Array<{ id: string; label: string; group?: string }>> {
     const result = await this.api<{
@@ -221,7 +225,26 @@ function splitCompositeId(id: string): [channel: string, ts: string] {
   return [id.slice(0, idx), id.slice(idx + 1)];
 }
 
-/** Normaliza emoji para nome do Slack: ':thumbsup:' → 'thumbsup'. */
+const UNICODE_TO_SLACK: Record<string, string> = {
+  '⚠️': 'warning',
+  '👍': 'thumbsup',
+  '👎': 'thumbsdown',
+  '❤️': 'heart',
+  '😂': 'joy',
+  '🎉': 'tada',
+  '✅': 'white_check_mark',
+  '❌': 'x',
+  '🔥': 'fire',
+  '👀': 'eyes',
+  '🙏': 'pray',
+};
+
+/**
+ * Normaliza emoji para nome do Slack.
+ * Aceita: ':thumbsup:' → 'thumbsup', '👍' → 'thumbsup', 'thumbsup' → 'thumbsup'.
+ * Emoji Unicode sem mapeamento é passado como está (pode falhar na API).
+ */
 function normalizeEmojiName(emoji: string): string {
+  if (UNICODE_TO_SLACK[emoji]) return UNICODE_TO_SLACK[emoji];
   return emoji.replace(/^:|:$/g, '');
 }

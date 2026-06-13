@@ -56,4 +56,11 @@ export interface ChannelProvider {
    * em vez do 200 vazio padrão — equivalente ao hub.challenge do WhatsApp, mas via POST.
    */
   handleWebhookChallenge?(body: unknown): string | null;
+
+  /**
+   * Opcional: abre (ou recupera) um canal de DM com um usuário a partir do seu userId nativo.
+   * Discord: cria DM channel via /users/@me/channels. Slack: conversations.open.
+   * Retorna o channelId que pode ser usado diretamente como `to` em send().
+   */
+  openDM?(userId: string): Promise<string>;
 }
