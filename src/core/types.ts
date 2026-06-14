@@ -1,4 +1,4 @@
-export type ChannelId = 'whatsapp' | 'discord' | 'slack';
+export type ChannelId = 'whatsapp' | 'discord' | 'slack' | 'teams';
 
 export type MediaType = 'image' | 'audio' | 'video' | 'document' | 'sticker';
 

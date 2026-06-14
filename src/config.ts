@@ -20,6 +20,11 @@ const envSchema = z.object({
   // Slack App — opcionais; se omitidos, o provider não é registrado
   SLACK_BOT_TOKEN: z.string().min(1).optional(),
   SLACK_SIGNING_SECRET: z.string().min(1).optional(),
+
+  // Microsoft Teams Bot — opcionais; se omitidos, o provider não é registrado
+  TEAMS_APP_ID: z.string().min(1).optional(),
+  TEAMS_APP_PASSWORD: z.string().min(1).optional(),
+  TEAMS_TENANT_ID: z.string().min(1).optional(), // omitir para bots multi-tenant
 });
 
 export type Config = z.infer<typeof envSchema>;
