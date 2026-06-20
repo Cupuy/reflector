@@ -27,6 +27,9 @@ interface TeamsPersistedState {
   serviceUrls: Record<string, string>;
   defaultServiceUrl: string | null;
   defaultTenantId: string | null;
+  // nome (se já visto) de cada team em que o bot foi instalado — null até a primeira
+  // activity que o traga; usado só para rotular grupos em listDestinations()
+  teamNames: Record<string, string | null>;
 }
 
 interface JwkRsaKey {
@@ -63,6 +66,8 @@ export class TeamsProvider implements ChannelProvider {
   // serviceUrl e tenantId padrão (da última atividade recebida) para mensagens proativas
   private defaultServiceUrl: string | null = null;
   private defaultTenantId: string | null = null;
+  // teams em que o bot foi instalado — teamId -> nome (null se ainda não observado)
+  private teamNames = new Map<string, string | null>();
 
   constructor(private readonly config: TeamsConfig) {}
 
@@ -115,6 +120,13 @@ export class TeamsProvider implements ChannelProvider {
     this.defaultServiceUrl = activity.serviceUrl;
     if (activity.channelData?.tenant?.id) {
       this.defaultTenantId = activity.channelData.tenant.id;
+    }
+    // Registra o team (se a activity veio de contexto de canal/grupo) — nome pode não
+    // vir em toda activity, então só sobrescreve quando de fato presente
+    const teamId = activity.channelData?.team?.id;
+    if (teamId) {
+      const teamName = activity.channelData?.team?.name ?? this.teamNames.get(teamId) ?? null;
+      this.teamNames.set(teamId, teamName);
     }
     this.saveState();
 
@@ -183,8 +195,9 @@ export class TeamsProvider implements ChannelProvider {
   }
 
   private toContent(activity: TeamsActivity) {
-    if (activity.text?.trim()) {
-      return { kind: 'text' as const, text: activity.text.trim() };
+    const text = this.stripBotMention(activity);
+    if (text) {
+      return { kind: 'text' as const, text };
     }
     if (activity.attachments.length > 0) {
       const att = activity.attachments[0]!;
@@ -196,6 +209,22 @@ export class TeamsProvider implements ChannelProvider {
       };
     }
     return { kind: 'unsupported' as const, nativeType: 'teams_message_no_content' };
+  }
+
+  /**
+   * Em canal/grupo o Teams só entrega a activity ao bot quando ele é @mencionado,
+   * e o texto vem com o trecho da menção embutido (ex.: "<at>NomeDoBot</at> oi") —
+   * sem isso, toda mensagem de canal apareceria com esse lixo de marcação na frente.
+   */
+  private stripBotMention(activity: TeamsActivity): string {
+    let text = activity.text ?? '';
+    const botId = activity.recipient?.id;
+    for (const entity of activity.entities) {
+      if (entity.type === 'mention' && entity.mentioned?.id === botId && entity.text) {
+        text = text.replace(entity.text, '');
+      }
+    }
+    return text.trim();
   }
 
   // ── Envio via Bot Framework REST ───────────────────────────────────────────
@@ -216,6 +245,13 @@ export class TeamsProvider implements ChannelProvider {
       );
     }
 
+    // `channel:<teamId>|<channelId>` indica um post novo (não-reply) num canal de team —
+    // diferente de DM/reply, isso exige criar a conversa com a activity já embutida
+    // (ver postToChannel) em vez de postar em /activities de uma conversationId existente.
+    if (message.to.startsWith('channel:')) {
+      return this.postToChannel(message.to.slice('channel:'.length), message);
+    }
+
     const conversationId = message.to;
     const serviceUrl = this.serviceUrlCache.get(conversationId) ?? this.defaultServiceUrl;
     if (!serviceUrl) {
@@ -225,6 +261,58 @@ export class TeamsProvider implements ChannelProvider {
       );
     }
 
+    const body = this.buildActivityBody(message);
+
+    const raw = await this.restPost<{ id: string }>(
+      serviceUrl,
+      `/v3/conversations/${encodeURIComponent(conversationId)}/activities`,
+      body,
+    );
+
+    return { providerMessageId: `${conversationId}|${raw.id}`, raw };
+  }
+
+  /**
+   * Cria um post novo (início de reply chain) num canal específico de um team.
+   * Diferente de DM/reply: a Connector API exige criar a conversa com a activity já
+   * dentro do corpo (`POST /v3/conversations` com `channelData.channel`), não criar a
+   * conversa vazia e postar depois — ver docs/learnings.md (Microsoft Teams).
+   */
+  private async postToChannel(teamAndChannel: string, message: OutboundMessage): Promise<SendResult> {
+    const [teamId, channelId] = splitCompositeId(teamAndChannel);
+    const serviceUrl = this.defaultServiceUrl;
+    if (!serviceUrl) {
+      throw new Error(
+        'Teams: nenhum serviceUrl cacheado. O bot precisa ter recebido ao menos uma activity antes de postar em canais.',
+      );
+    }
+
+    const body: Record<string, unknown> = {
+      activity: this.buildActivityBody(message),
+      bot: { id: `28:${this.config.appId}`, name: 'Bot' },
+      channelData: {
+        channel: { id: channelId },
+        team: { id: teamId },
+        ...(this.defaultTenantId ? { tenant: { id: this.defaultTenantId } } : {}),
+      },
+      isGroup: true,
+      ...(this.defaultTenantId ? { tenantId: this.defaultTenantId } : {}),
+    };
+
+    const raw = await this.restPost<{ id: string; activityId: string }>(
+      serviceUrl,
+      '/v3/conversations',
+      body,
+    );
+
+    this.serviceUrlCache.set(raw.id, serviceUrl);
+    this.saveState();
+
+    return { providerMessageId: `${raw.id}|${raw.activityId}`, raw };
+  }
+
+  private buildActivityBody(message: OutboundMessage): Record<string, unknown> {
+    const content = message.content;
     const body: Record<string, unknown> = { type: 'message' };
 
     if (message.replyTo !== undefined) {
@@ -258,13 +346,7 @@ export class TeamsProvider implements ChannelProvider {
         );
     }
 
-    const raw = await this.restPost<{ id: string }>(
-      serviceUrl,
-      `/v3/conversations/${encodeURIComponent(conversationId)}/activities`,
-      body,
-    );
-
-    return { providerMessageId: `${conversationId}|${raw.id}`, raw };
+    return body;
   }
 
   async markAsRead(_providerMessageId: string): Promise<void> {
@@ -317,13 +399,78 @@ export class TeamsProvider implements ChannelProvider {
   // ── Destinos e DM ──────────────────────────────────────────────────────────
 
   async listDestinations(): Promise<Array<{ id: string; label: string; group?: string }>> {
-    // Retorna conversas conhecidas do cache (populado por mensagens recebidas)
-    // Listagem completa de times/canais exigiria Microsoft Graph API (escopo adicional)
-    return Array.from(this.serviceUrlCache.keys()).map((id) => ({
-      id,
-      label: id,
-      group: 'Conversas conhecidas',
-    }));
+    const results: Array<{ id: string; label: string; group?: string }> = [];
+
+    // Conversas 1:1 conhecidas — sempre prefixo "a:", diferente dos ids de canal/thread
+    // (prefixo "19:"), que são listados de forma completa abaixo via fetchChannelList
+    for (const conversationId of this.serviceUrlCache.keys()) {
+      if (!conversationId.startsWith('a:')) continue;
+      results.push({ id: conversationId, label: conversationId, group: 'Conversas diretas conhecidas' });
+    }
+
+    // Canais de cada team conhecido — busca completa via Connector API (não só os
+    // canais onde o bot já foi @mencionado, que é tudo que `serviceUrlCache` teria)
+    for (const [teamId, teamName] of this.teamNames) {
+      try {
+        const channels = await this.fetchChannelList(teamId);
+        // Best-effort: a Connector API não expõe membershipType, só Graph. Sem a permissão
+        // de aplicativo `Channel.ReadBasic.All` (ou sem TEAMS_TENANT_ID), degrada silenciosamente
+        // para "sem indicação de privacidade" em vez de quebrar a listagem inteira.
+        const membershipTypes = await this.fetchChannelMembershipTypes(teamId).catch(
+          () => new Map<string, string>(),
+        );
+        for (const ch of channels) {
+          // Canal privado/compartilhado exige membership própria (ver docs/learnings.md,
+          // item "Canais privados exigem membership própria") — sinaliza no label para que
+          // o dashboard não deixe escolher um canal restrito sem aviso.
+          const restricted = membershipTypes.get(ch.id) === 'private' || membershipTypes.get(ch.id) === 'shared';
+          results.push({
+            id: `channel:${teamId}|${ch.id}`,
+            label: (restricted ? '🔒 ' : '') + (ch.name ?? 'Geral'),
+            group: teamName ?? teamId,
+          });
+        }
+      } catch {
+        // team sem canal acessível (ex.: permissão) — ignora, como o Discord faz para guilds sem acesso
+      }
+    }
+
+    return results;
+  }
+
+  /** Lista todos os canais de um team — não exige activity prévia em cada canal individualmente. */
+  private async fetchChannelList(teamId: string): Promise<Array<{ id: string; name: string | null }>> {
+    const serviceUrl = this.defaultServiceUrl;
+    if (!serviceUrl) return [];
+
+    const token = await this.getAccessToken();
+    const url = `${normalizeServiceUrl(serviceUrl)}/v3/teams/${encodeURIComponent(teamId)}/conversations`;
+
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      throw new Error(`Teams API GET /v3/teams/${teamId}/conversations → ${res.status}: ${await res.text()}`);
+    }
+
+    const json = (await res.json()) as { conversations: Array<{ id: string; name: string | null }> };
+    return json.conversations;
+  }
+
+  /**
+   * Busca o membershipType ("standard" | "private" | "shared") de cada canal de um team via
+   * Microsoft Graph — a Bot Framework Connector API (fetchChannelList) só retorna id/name,
+   * sem indicação de privacidade. Requer permissão de aplicativo `Channel.ReadBasic.All`.
+   */
+  private async fetchChannelMembershipTypes(teamId: string): Promise<Map<string, string>> {
+    const token = await this.getGraphAccessToken();
+    const url = `https://graph.microsoft.com/v1.0/teams/${encodeURIComponent(teamId)}/channels?$select=id,membershipType`;
+
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      throw new Error(`Teams Graph GET /teams/${teamId}/channels → ${res.status}: ${await res.text()}`);
+    }
+
+    const json = (await res.json()) as { value: Array<{ id: string; membershipType: string }> };
+    return new Map(json.value.map((c) => [c.id, c.membershipType]));
   }
 
   /**
@@ -577,6 +724,8 @@ export class TeamsProvider implements ChannelProvider {
     this.serviceUrlCache = new Map(Object.entries(state.serviceUrls));
     this.defaultServiceUrl = state.defaultServiceUrl;
     this.defaultTenantId = state.defaultTenantId;
+    // `teamNames` não existe em arquivos de estado salvos antes dessa propriedade existir
+    this.teamNames = new Map(Object.entries(state.teamNames ?? {}));
   }
 
   private saveState(): void {
@@ -586,6 +735,7 @@ export class TeamsProvider implements ChannelProvider {
       serviceUrls: Object.fromEntries(this.serviceUrlCache),
       defaultServiceUrl: this.defaultServiceUrl,
       defaultTenantId: this.defaultTenantId,
+      teamNames: Object.fromEntries(this.teamNames),
     };
 
     mkdirSync(dirname(this.config.statePath), { recursive: true });

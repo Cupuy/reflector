@@ -26,6 +26,16 @@ export const teamsReactionSchema = z.object({
   type: z.string(),
 });
 
+// Entidade genérica de activity — usada aqui só para extrair menções (@bot) do texto
+// em mensagens de canal/grupo, onde o Teams sempre prefixa o texto com `<at>NomeDoBot</at>`
+export const teamsEntitySchema = z
+  .object({
+    type: z.string(),
+    text: z.string().optional(),
+    mentioned: teamsChannelAccountSchema.optional(),
+  })
+  .passthrough();
+
 export const teamsActivitySchema = z
   .object({
     type: z.string(),
@@ -42,10 +52,13 @@ export const teamsActivitySchema = z
     // Presentes em activities do tipo messageReaction
     reactionsAdded: z.array(teamsReactionSchema).optional(),
     reactionsRemoved: z.array(teamsReactionSchema).optional(),
+    // Menções (@bot) em mensagens de canal/grupo — Teams só entrega a activity ao bot
+    // quando ele é mencionado, e o texto vem com "<at>NomeDoBot</at>" embutido
+    entities: z.array(teamsEntitySchema).default([]),
     channelData: z
       .object({
         team: z.object({ id: z.string(), name: z.string().optional() }).optional(),
-        channel: z.object({ id: z.string() }).optional(),
+        channel: z.object({ id: z.string(), name: z.string().optional() }).optional(),
         tenant: z.object({ id: z.string() }).optional(),
       })
       .passthrough()

@@ -56,12 +56,18 @@
   a.wr-link { color: var(--accent); text-decoration: none; font-size: 12px; }
   a.wr-link:hover { text-decoration: underline; }
   .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-top: 8px; }
-  form.send { display: flex; gap: 8px; padding: 0 20px 4px; flex-wrap: wrap; align-items: center; }
-  form.send input { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; }
-  form.send input[name=text] { flex: 1; min-width: 200px; }
-  form.send select { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; min-width: 220px; max-width: 340px; }
-  form.send select:focus { outline: none; border-color: var(--accent); }
-  form.send.disabled { opacity: 0.4; pointer-events: none; }
+  .send-trigger { padding: 0 20px 8px; }
+  .send-trigger.disabled button { opacity: 0.4; pointer-events: none; }
+  dialog#compose-modal { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 16px; width: min(520px, 90vw); }
+  dialog#compose-modal::backdrop { background: rgba(0, 0, 0, 0.6); }
+  dialog#compose-modal h2 { font-size: 14px; margin: 0 0 12px; }
+  dialog#compose-modal h2 span { color: var(--accent); }
+  #compose-form { display: flex; flex-direction: column; gap: 8px; }
+  #compose-form input, #compose-form textarea, #compose-form select { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 6px 10px; font: inherit; width: 100%; }
+  #compose-form select { min-width: 0; }
+  #compose-form textarea { min-height: 90px; resize: vertical; }
+  #compose-form .row { align-items: center; }
+  #compose-title-row[hidden] { display: none; }
   .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
   .actions button { padding: 2px 10px; font-size: 12px; }
   .actions input { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 2px 8px; font: inherit; font-size: 12px; flex: 1; min-width: 120px; }
@@ -92,13 +98,29 @@
   <button id="refresh">atualizar</button>
 </header>
 
-<form class="send disabled" id="send-form">
-  <input id="to-input" name="to" placeholder="destinatário" required>
-  <select id="to-select" hidden></select>
-  <input name="text" placeholder="mensagem de texto" required>
-  <button type="submit" id="send-btn">selecione um canal para enviar</button>
-</form>
-<div id="send-result"></div>
+<div class="send-trigger disabled" id="send-trigger">
+  <button type="button" id="compose-open-btn" disabled>selecione um canal para enviar</button>
+</div>
+
+<dialog id="compose-modal">
+  <form id="compose-form">
+    <h2>Compor mensagem — <span id="compose-channel-label"></span></h2>
+    <div class="row">
+      <input id="to-input" name="to" placeholder="destinatário" required>
+      <select id="to-select" hidden></select>
+      <span class="muted" id="compose-type-badge"></span>
+    </div>
+    <div class="row" id="compose-title-row" hidden>
+      <input id="compose-title" placeholder="título (negrito — Teams não tem campo nativo de assunto; simulado via Markdown)">
+    </div>
+    <textarea name="text" placeholder="mensagem de texto" required></textarea>
+    <div class="row">
+      <button type="submit">enviar</button>
+      <button type="button" id="compose-cancel">cancelar</button>
+    </div>
+    <div id="send-result"></div>
+  </form>
+</dialog>
 
 <section class="provision-panel" id="section-teams-provision" hidden>
   <h2>Provisionamento Teams (Microsoft Graph)</h2>
@@ -109,6 +131,13 @@
   </div>
   <div id="teams-users-result" class="muted"></div>
   <div id="teams-users-list" class="users-list"></div>
+
+  <h2>Canais e conversas conhecidas</h2>
+  <div class="row">
+    <button id="teams-load-destinations">carregar canais/conversas</button>
+  </div>
+  <div id="teams-destinations-result" class="muted"></div>
+  <div id="teams-destinations-list" class="users-list"></div>
 </section>
 
 <main class="all-channels" id="main">
@@ -298,20 +327,29 @@ async function loadDestinations(channel) {
 
 function updateUI() {
   const main = $('#main');
-  const sendForm = $('#send-form');
-  const sendBtn = $('#send-btn');
+  const sendTrigger = $('#send-trigger');
+  const openBtn = $('#compose-open-btn');
   const toInput = $('#to-input');
   const toSelect = $('#to-select');
+
+  // Limpa o destinatário ao trocar de canal/aba — sem isso, um id deixado por um envio
+  // anterior (ex.: de "abrir DM") permanece no campo e pode receber o próximo envio por engano
+  toInput.value = '';
+  $('#send-result').textContent = '';
 
   if (activeChannel) {
     main.className = 'single-channel';
     $('#section-outbound').hidden = false;
     $('#section-inbound').hidden = false;
-    sendForm.classList.remove('disabled');
-    sendBtn.textContent = 'enviar via ' + activeChannel;
+    sendTrigger.classList.remove('disabled');
+    openBtn.disabled = false;
+    openBtn.textContent = 'compor mensagem via ' + activeChannel;
 
     // Canais com seletor de destino mostram <select>; outros mostram <input>
-    // Discord e Slack têm listagem de canais via API; WhatsApp/Teams usam destinatário livre
+    // Discord e Slack têm listagem de canais via API com <select>; WhatsApp usa destinatário livre.
+    // Teams também lista canais/conversas via API, mas pelo painel de provisionamento
+    // (botão "usar como destinatário" preenche o <input>) — ver #section-teams-provision —
+    // porque o mesmo <input> já é usado pelo fluxo de abrir DM.
     const hasDestinations = activeChannel === 'discord' || activeChannel === 'slack';
     toInput.hidden = hasDestinations;
     toInput.required = !hasDestinations;
@@ -321,8 +359,9 @@ function updateUI() {
     main.className = 'all-channels';
     $('#section-outbound').hidden = true;
     $('#section-inbound').hidden = true;
-    sendForm.classList.add('disabled');
-    sendBtn.textContent = 'selecione um canal para enviar';
+    sendTrigger.classList.add('disabled');
+    openBtn.disabled = true;
+    openBtn.textContent = 'selecione um canal para enviar';
     toInput.hidden = false;
     toInput.required = true;
     toSelect.hidden = true;
@@ -341,6 +380,19 @@ $('#channel-tabs').addEventListener('click', (e) => {
   load();
 });
 
+// Simula um "assunto" em negrito via Markdown — único formato que o Teams renderiza
+// destacado num canal (a Connector API não tem campo de assunto nativo). Usado tanto ao
+// compor quanto ao corrigir/editar, para o resultado final ficar no mesmo formato.
+function withTitle(title, text) {
+  return title ? '**' + title + '**\n\n' + text : text;
+}
+
+// Reply chain de canal do Teams tem conversationId com prefixo "19:" (ver docs/learnings.md);
+// DM/grupo usa "a:". Só em canal confirmamos que o negrito do título acima realmente renderiza.
+function isTeamsChannelMessage(m) {
+  return m.channel === 'teams' && m.providerMessageId.split('|')[0].startsWith('19:');
+}
+
 function renderOutbound(messages, timelines) {
   if (!messages.length) return '<div class="empty">nenhuma mensagem enviada ainda</div>';
   return messages.map((m) => {
@@ -350,6 +402,7 @@ function renderOutbound(messages, timelines) {
       ? statuses.map((s) => statusBadge(s.status)).join(' ')
       : '<span class="muted">aguardando status…</span>';
     const isDiscord = m.channel === 'discord';
+    const isTeamsChannel = isTeamsChannelMessage(m);
     return '<div class="card">' +
       '<div class="row"><strong>→ ' + esc(m.recipient) + '</strong>' +
       '<span class="muted">' + fmtDate(m.sentAt) + '</span></div>' +
@@ -360,8 +413,9 @@ function renderOutbound(messages, timelines) {
         ? '<input data-role="edit-text" placeholder="editar conteúdo…">' +
           '<button data-action="edit">editar</button>' +
           '<button data-action="delete">deletar</button>'
-        : '<input data-role="correct-text" placeholder="texto corrigido…">' +
-          '<button data-action="correct">corrigir (⚠️ + reply)</button>') +
+        : (isTeamsChannel ? '<input data-role="correct-title" placeholder="título (negrito, opcional)">' : '') +
+          '<input data-role="correct-text" placeholder="texto corrigido…">' +
+          '<button data-action="correct">' + (isTeamsChannel ? 'corrigir' : 'corrigir (⚠️ + reply)') + '</button>') +
       '<span class="muted feedback"></span>' +
       '</div>' +
       '<details data-key="out-' + m.id + '"><summary>detalhes + payloads</summary>' +
@@ -540,11 +594,54 @@ $('#teams-users-list').addEventListener('click', async (event) => {
         return;
       }
       $('#to-input').value = data.channelId;
-      feedback.textContent = 'DM aberta ✓ — destinatário preenchido no envio acima';
+      feedback.textContent = 'DM aberta ✓ — clique em "compor mensagem" para enviar';
     } catch (error) {
       feedback.textContent = 'falha: ' + error.message;
     }
   }
+});
+
+function renderTeamsDestinations(destinations) {
+  if (!destinations.length) return '<div class="empty">nenhum canal/conversa conhecido — @mencione o bot num canal, ou abra uma DM acima</div>';
+  const groups = {};
+  for (const d of destinations) {
+    const g = d.group ?? '';
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(d);
+  }
+  return Object.entries(groups).map(([groupName, items]) =>
+    '<div class="label">' + esc(groupName) + '</div>' +
+    items.map((d) =>
+      '<div class="card">' +
+      '<div class="row"><strong>' + esc(d.label) + '</strong></div>' +
+      '<div class="row muted">' + esc(d.id) + '</div>' +
+      '<div class="actions" data-destination-id="' + esc(d.id) + '">' +
+      '<button data-action="use-destination">usar como destinatário</button>' +
+      '<span class="muted feedback"></span>' +
+      '</div></div>'
+    ).join('')
+  ).join('');
+}
+
+$('#teams-load-destinations').addEventListener('click', async () => {
+  const resultEl = $('#teams-destinations-result');
+  resultEl.textContent = 'carregando…';
+  try {
+    const destinations = await fetchJson('/api/teams/destinations');
+    resultEl.textContent = destinations.length + ' destinos conhecidos';
+    $('#teams-destinations-list').innerHTML = renderTeamsDestinations(destinations);
+  } catch (error) {
+    resultEl.textContent = 'erro ao carregar: ' + error.message;
+  }
+});
+
+$('#teams-destinations-list').addEventListener('click', (event) => {
+  const button = event.target.closest('.actions button[data-action="use-destination"]');
+  if (!button) return;
+  event.stopPropagation();
+  const actions = button.closest('.actions');
+  $('#to-input').value = actions.dataset.destinationId;
+  actions.querySelector('.feedback').textContent = 'preenchido ✓ — clique em "compor mensagem" para enviar';
 });
 
 function typingReply() {
@@ -641,10 +738,12 @@ document.addEventListener('click', async (event) => {
     correct: () => {
       const text = actions.querySelector('[data-role=correct-text]').value.trim();
       if (!text) return Promise.reject(new Error('digite o texto corrigido'));
+      const titleEl = actions.querySelector('[data-role=correct-title]');
+      const body = withTitle(titleEl ? titleEl.value.trim() : '', text);
       return fetch('/api/' + channel + '/messages/' + encodeURIComponent(wamid) + '/correct', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text: body }),
       });
     },
     edit: () => {
@@ -673,13 +772,53 @@ document.addEventListener('click', async (event) => {
   }
 });
 
-$('#send-form').addEventListener('submit', async (event) => {
+function currentTo() {
+  return $('#to-select').hidden ? $('#to-input').value.trim() : $('#to-select').value;
+}
+
+/**
+ * "Tipo" do destinatário (individual vs canal), detectado pelo prefixo sintético do
+ * próprio id — `dm:` no Discord, `channel:` no Teams (ver docs/learnings.md). Slack e
+ * WhatsApp não têm um sinal confiável nesse id sozinho, então ficam sem badge.
+ */
+function detectDestinationType(channel, to) {
+  if (!to) return null;
+  if (channel === 'teams') return to.startsWith('channel:') ? 'canal' : 'individual';
+  if (channel === 'discord') return to.startsWith('dm:') ? 'individual' : 'canal';
+  return null;
+}
+
+function refreshComposeFields() {
+  const to = currentTo();
+  const type = detectDestinationType(activeChannel, to);
+  $('#compose-type-badge').textContent = type ? '(' + type + ')' : '';
+  // Título é só um recurso visual do dashboard (negrito via Markdown) — Teams não tem
+  // campo de "assunto" nativo na Connector API, então só faz sentido oferecer o campo
+  // quando o destino é mesmo um canal do Teams, onde confirmamos que renderiza negrito.
+  $('#compose-title-row').hidden = !(activeChannel === 'teams' && type === 'canal');
+}
+
+$('#compose-open-btn').addEventListener('click', () => {
+  $('#compose-channel-label').textContent = activeChannel;
+  $('#send-result').textContent = '';
+  refreshComposeFields();
+  $('#compose-modal').showModal();
+});
+
+$('#compose-cancel').addEventListener('click', () => $('#compose-modal').close());
+$('#to-input').addEventListener('input', refreshComposeFields);
+$('#to-select').addEventListener('change', refreshComposeFields);
+
+$('#compose-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!activeChannel) return;
   const form = new FormData(event.target);
-  // Para canais com seletor de destino, o `to` vem do <select>; para os outros, do <input>
-  const to = $('#to-select').hidden ? form.get('to') : $('#to-select').value;
+  const to = currentTo();
   if (!to) { $('#send-result').textContent = 'selecione um canal de destino'; return; }
+
+  const title = $('#compose-title-row').hidden ? '' : $('#compose-title').value.trim();
+  const text = withTitle(title, form.get('text'));
+
   const result = $('#send-result');
   result.textContent = 'enviando…';
   try {
@@ -688,14 +827,19 @@ $('#send-form').addEventListener('submit', async (event) => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         to,
-        content: { kind: 'text', text: form.get('text') },
+        content: { kind: 'text', text },
       }),
     });
     const data = await res.json();
     result.textContent = res.ok
-      ? 'enviado — ' + data.providerMessageId
-      : 'erro ' + res.status + ' — ' + JSON.stringify(data);
-    if (res.ok) load();
+      ? 'enviado para ' + to + ' — ' + data.providerMessageId
+      : 'erro ' + res.status + ' (destinatário: ' + to + ') — ' + JSON.stringify(data);
+    if (res.ok) {
+      $('#compose-title').value = '';
+      event.target.querySelector('textarea[name=text]').value = '';
+      $('#compose-modal').close();
+      load();
+    }
   } catch (error) {
     result.textContent = 'falha: ' + error.message;
   }
