@@ -73,3 +73,68 @@ Para deduplicação via `INSERT OR IGNORE`, foi necessário construir um ID sint
 **Solução:** o reflector expõe `POST /api/discord/dm` com `{ userId }` para criar/recuperar o canal de DM e retornar o `channelId` para uso nos envios subsequentes.
 
 **Implicação para a abstração:** o campo `to` de `OutboundMessage` não tem semântica uniforme — cada canal usa seu próprio espaço de endereços. O projeto oficial pode precisar de uma camada de resolução de endereços por provider.
+
+---
+
+## Microsoft Teams
+
+### 2026-06-20 — Provisionamento de app é Microsoft Graph, não Bot Framework
+
+**Contexto:** queríamos listar os usuários do tenant e instalar o bot proativamente para um usuário específico, sem ele precisar abrir o Teams e adicionar o app manualmente.
+
+**Descoberta:** isso não passa pela Bot Framework Connector API (usada em `send`/`editMessage`/`openDM`, escopo `api.botframework.com`). É Microsoft Graph (`graph.microsoft.com`), com OAuth2 e permissões de aplicativo próprias — `User.Read.All` para listar usuários do tenant, `TeamsAppInstallation.ReadWriteForUser.All` para instalar um app em nome de um usuário — concedidas com consentimento de admin no mesmo App Registration do bot. Além disso, só é possível instalar via Graph um app que já está publicado no **catálogo do tenant** (`appCatalogs/teamsApps`, com um `teamsAppId` próprio, diferente do Application ID do App Registration); um app apenas sideloaded (como o bot deste laboratório) não tem entrada no catálogo e não pode ser instalado por essa rota.
+
+**Implicação para a abstração:** isso não é um conceito de canal de mensageria — não há equivalente em WhatsApp/Discord/Slack (no máximo, um fluxo de instalação via OAuth iniciado pelo próprio usuário, nunca um provisionamento administrativo via API). Por isso `listOrgUsers`/`installApp` ficaram como métodos próprios de `TeamsProvider`, fora da interface `ChannelProvider`, com rotas dedicadas (`/api/teams/users`, `/api/teams/install`) registradas em `src/server/index.ts` em vez de `src/server/app.ts` — o dispatcher genérico de canais permanece agnóstico.
+
+### 2026-06-20 — `openDM` não deve prefixar "29:" no AAD Object ID
+
+**Sintoma:** `POST /api/teams/dm` com o AAD Object ID de um usuário (vindo de `listOrgUsers`/Graph) retornava `403 BadArgument: Failed to decrypt pairwise id`.
+
+**Causa:** o código original assumia que todo `userId` sem prefixo `29:` precisava receber esse prefixo antes de ir para `members[].id` em `POST /v3/conversations`. Isso é válido para um id Teams já cunhado nesse formato (ex.: vindo de `from.id` de uma activity recebida), mas um AAD Object ID puro **não pode** virar um id Teams só prependendo `29:` — esse prefixo denota um token opaco específico do canal, não um namespace livre.
+
+**Solução:** parei de prefixar — `members: [{ id: userId }]` aceita o AAD Object ID puro (do Graph) e também o id já no formato `29:xxx` (de uma activity), sem distinção. Confirmado via teste manual contra a Connector API: ambos os formatos retornam a mesma conversa 1:1 já existente.
+
+**Implicação para a abstração:** assim como o aprendizado equivalente do WhatsApp (`contactId` do evento inbound ≠ endereço de envio), aqui o inverso também é verdade: um id de usuário obtido por **outra API do mesmo canal** (Graph, não Bot Framework) pode ser diretamente utilizável como member id, mas só se não for adulterado por suposições de formato erradas. Vale desconfiar de qualquer prefixo/sufixo "mágico" adicionado a um id de fora do provider sem confirmação experimental.
+
+### 2026-06-20 — `serviceUrl` para mensagens proativas precisa sobreviver a restarts
+
+**Sintoma:** `POST /api/teams/dm` retornava `500: Teams: nenhum serviceUrl cacheado` mesmo após o bot já ter trocado mensagens com o usuário antes — bastava reiniciar o servidor (no dev, qualquer save sob `tsx watch`) para o erro voltar.
+
+**Causa:** o Bot Framework não expõe o `serviceUrl` (endpoint regional da Connector API para aquele tenant/cloud) por nenhuma API de consulta — ele só chega como campo de uma activity recebida via webhook. O reflector cacheava isso (`defaultServiceUrl`/`defaultTenantId`/`serviceUrlCache`) só em memória, então qualquer restart do processo perdia o cache e exigia receber uma activity nova antes de qualquer mensagem proativa (`openDM`, `send` para uma conversa nunca vista neste processo).
+
+**Solução:** `TeamsProvider` agora persiste esse cache em um arquivo JSON (`statePath`, configurado em `src/server/index.ts` como `<dirname(DATABASE_PATH)>/teams-state.json`) — carregado em `start()` e regravado a cada activity recebida ou DM aberta. Fica fora do `MessageStore`/SQLite genérico de propósito: `serviceUrl` é um conceito só do Bot Framework, sem equivalente em WhatsApp/Discord/Slack (que enviam proativamente com só um token + endpoint fixo), então vazar isso para `core/store.ts` seria o mesmo erro de abstração já registrado para `listOrgUsers`/`installApp`.
+
+**Implicação para a abstração:** nem todo estado "de canal" cabe no `MessageStore` genérico — alguns providers precisam de um pedaço de estado de conexão próprio (aqui, "onde fica o endpoint da API para este tenant") que não é nem mensagem nem webhook request. Vale isolar esse tipo de cache dentro do diretório do provider (arquivo próprio, ou tabela própria se crescer) em vez de forçar um encaixe nas tabelas genéricas.
+
+### 2026-06-20 — `providerMessageId` do Teams excede o `maxParamLength` padrão do router
+
+**Sintoma:** `editMessage`/`deleteMessage` do `TeamsProvider` estavam corretos (confirmado contra a Connector API real), mas `PATCH`/`DELETE /api/teams/messages/:providerMessageId`, `/correct` e `/api/messages/:providerMessageId/timeline` retornavam 404 — não o 404 customizado do handler, o 404 genérico do Fastify ("Route ... not found"), ou seja, a rota nunca era alcançada.
+
+**Causa:** o router do Fastify (`find-my-way`) tem `maxParamLength` default de 100 caracteres por segmento de rota — acima disso, ele **não dá erro, simplesmente não casa a rota** (404 silencioso). O `providerMessageId` composto do Teams (`conversationId|activityId`) passa disso com folga: só o `conversationId` de uma conversa 1:1 já vem com 130+ caracteres. WhatsApp/Slack/Discord nunca expuseram esse limite porque seus ids compostos são bem mais curtos.
+
+**Solução:** `Fastify({ maxParamLength: 300 })` em `src/server/app.ts`. Testado de ponta a ponta contra a Connector API real (`PATCH`, `DELETE`, `/correct`) após o aumento — os três funcionam.
+
+**Implicação para a abstração:** o dispatcher genérico (`src/server/app.ts`) assumiu implicitamente um teto de tamanho para `providerMessageId` que nenhum canal anterior chegava perto de violar. Um limite de infraestrutura desse tipo só aparece quando um canal novo estressa uma dimensão que os outros nunca estressaram — vale tratar qualquer "funciona com curl direto no provider mas 404 via rota" como suspeito de limite do framework, não de bug no provider.
+
+### 2026-06-20 — Bot não pode enviar reações com a própria identidade no Teams
+
+**Contexto:** WhatsApp, Slack e Discord enviam reações como o próprio bot (token do bot reage, e a reação aparece como tendo sido feita pelo bot/app). Queríamos paridade no Teams.
+
+**Descoberta:** não existe caminho para isso.
+- Bot Framework Connector API (usada em `send`/`editMessage`/`deleteMessage`) não expõe nenhuma operação de reação — a lista completa de operações é `Create conversation`, `Send/Reply to activity`, `Update/Delete activity`, `Get/Delete member(s)`, `Send conversation history`, attachments; `MessageReaction` só existe como campo recebido em activities inbound (`messageReaction`), nunca como algo postável.
+- Microsoft Graph `chatMessage: setReaction` (`POST /chats/{id}/messages/{id}/setReaction` ou o equivalente em `/teams/.../channels/...`) declara explicitamente **Application: Not supported** na tabela de permissões, tanto para chat quanto para channel — só funciona com permissão delegada (usuário autenticado). Fonte: [chatMessage: setReaction](https://learn.microsoft.com/en-us/graph/api/chatmessage-setreaction?view=graph-rest-1.0).
+- Mesmo implementando o fluxo OAuth delegado (OAuthCard + magic code via Bot Framework Token Service), o token resultante representa o **usuário que fez login**, não o bot — é assim que delegated permission funciona no Microsoft identity platform (a chamada à Graph fica autenticada como aquela pessoa). A reação apareceria como "fulano reagiu", nunca como o bot. Não há equivalente a um "token delegado do próprio bot": um service principal não consegue se autenticar interativamente.
+
+**Decisão:** não implementado. `send()` lança erro explicando a causa real (nem Bot Framework nem Graph app-only suportam, e Graph delegado não resolveria o objetivo de "bot reage"). Reações **recebidas** (usuário reage à mensagem do bot) continuam funcionando normalmente via `messageReaction` inbound — é a direção que de fato importa para o objetivo do laboratório (capturar a interação do usuário), e essa direção não tem essa limitação.
+
+**Implicação para a abstração:** o tipo agnóstico `OutboundMessage.content.kind === 'reaction'` em `core/types.ts` assume implicitamente que "o bot pode reagir com a própria identidade" — verdade em WhatsApp/Slack/Discord, falsa no Teams. Diferente da maioria das fricções catalogadas aqui (que são sobre *como* traduzir um conceito equivalente), essa é sobre um canal **não ter o conceito** do lado de envio — e nenhuma camada de abstração resolve isso; o melhor que `core` pode fazer é manter `send()` como `Promise` que pode rejeitar, e cada provider documentar claramente quando uma capacidade do `OutboundMessage` não tem equivalente nativo.
+
+### 2026-06-20 — Responder no dashboard usava o `sender` (userId) como `to`, mas Teams precisa do conversationId
+
+**Sintoma:** clicar "responder" numa mensagem recebida no dashboard, para Teams, retornava `400: {"error":{"code":"ServiceError","message":"Unknown"}}` da Connector API, num `POST /v3/conversations/<id>/activities` onde `<id>` era visivelmente um id de usuário (`29:xxx`), não uma conversa.
+
+**Causa:** o dashboard (`public/index.html`) calcula o endereço de reply genericamente como `m.sender`, que funciona para WhatsApp (telefone serve tanto de sender quanto de endereço de envio). Já tinha sido corrigido para Discord (`replyTo = providerMessageId.split(':')[0]` → channelId) — ver aprendizado "Endereço de envio é channel_id, não userId" — mas Teams ficou de fora dessa exceção e caiu no caminho genérico, enviando o `from.id` (`29:xxx`, formato de membro) como se fosse `conversationId`.
+
+**Solução:** mesmo padrão do Discord, adaptado ao separador do Teams: `replyTo = providerMessageId.split('|')[0]` (a parte antes do `|` é o `conversationId`, já que o provider monta `providerMessageId` como `` `${conversationId}|${activityId}` ``).
+
+**Implicação para a abstração:** reforça o aprendizado do Discord — "endereço de envio ≠ sender" não é exceção rara, é a regra para qualquer canal cujo `providerMessageId` componha `conversationId` com algo mais. Qualquer novo canal adicionado ao dashboard precisa ser auditado contra essa suposição (`replyTo = m.sender`) antes de assumir que vai funcionar — o `core` não tem como impor isso porque a semântica de `to` é, por design, opaca e específica de cada provider.
