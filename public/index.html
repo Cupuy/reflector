@@ -69,6 +69,12 @@
   #send-result { padding: 0 20px 8px; font-size: 12px; color: var(--muted); word-break: break-all; }
   .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
   .sentinel { text-align: center; padding: 12px 0; color: var(--muted); font-size: 12px; }
+  .provision-panel { padding: 0 20px 16px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .provision-panel .row { margin-bottom: 8px; }
+  .provision-panel input { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 4px 10px; font: inherit; }
+  .provision-panel input#teams-app-id { min-width: 280px; }
+  .provision-panel input#teams-user-filter { flex: 1; min-width: 200px; }
+  .provision-panel .users-list { max-height: 360px; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -93,6 +99,17 @@
   <button type="submit" id="send-btn">selecione um canal para enviar</button>
 </form>
 <div id="send-result"></div>
+
+<section class="provision-panel" id="section-teams-provision" hidden>
+  <h2>Provisionamento Teams (Microsoft Graph)</h2>
+  <div class="row">
+    <input id="teams-app-id" placeholder="id do app no catálogo (teamsAppId)">
+    <button id="teams-load-users">carregar usuários</button>
+    <input id="teams-user-filter" placeholder="filtrar por nome/e-mail/UPN…">
+  </div>
+  <div id="teams-users-result" class="muted"></div>
+  <div id="teams-users-list" class="users-list"></div>
+</section>
 
 <main class="all-channels" id="main">
   <section id="section-outbound" hidden>
@@ -310,6 +327,8 @@ function updateUI() {
     toInput.required = true;
     toSelect.hidden = true;
   }
+
+  $('#section-teams-provision').hidden = activeChannel !== 'teams';
 }
 
 $('#channel-tabs').addEventListener('click', (e) => {
@@ -387,9 +406,16 @@ function renderInbound(messages) {
   if (!messages.length) return '<div class="empty">nenhuma mensagem recebida ainda</div>';
   return messages.map((m) => {
     const isDiscord = m.channel === 'discord';
+    const isTeams = m.channel === 'teams';
     // Para Discord: `to` de reply é o channelId (parte antes do ':' no providerMessageId)
-    // Para WhatsApp: `to` de reply é o sender (número de telefone)
-    const replyTo = isDiscord ? m.providerMessageId.split(':')[0] : m.sender;
+    // Para Teams: `to` de reply é o conversationId (parte antes do '|' no providerMessageId) —
+    // `sender` é o id do usuário (29:xxx), que não é um conversationId válido para POST /v3/conversations/:id/activities
+    // Para WhatsApp/Slack: `to` de reply é o sender
+    const replyTo = isDiscord
+      ? m.providerMessageId.split(':')[0]
+      : isTeams
+        ? m.providerMessageId.split('|')[0]
+        : m.sender;
     return '<div class="card">' +
     '<div class="row"><strong>← ' + esc(m.sender) + '</strong>' +
     '<span class="muted">' + fmtDate(m.receivedAt) + '</span></div>' +
@@ -425,6 +451,101 @@ function renderWebhooks(requests) {
     '</details></div>'
   ).join('');
 }
+
+// ── Provisionamento Teams (Microsoft Graph) ─────────────────────────────────
+
+let teamsUsersCache = [];
+
+function renderTeamsUsers(users, filter) {
+  const f = (filter || '').trim().toLowerCase();
+  const filtered = f
+    ? users.filter((u) =>
+        (u.displayName || '').toLowerCase().includes(f) ||
+        (u.mail || '').toLowerCase().includes(f) ||
+        (u.userPrincipalName || '').toLowerCase().includes(f) ||
+        u.id.toLowerCase().includes(f))
+    : users;
+  if (!filtered.length) return '<div class="empty">nenhum usuário encontrado</div>';
+  return filtered.map((u) =>
+    '<div class="card">' +
+    '<div class="row"><strong>' + esc(u.displayName || '(sem nome)') + '</strong>' +
+    '<span class="muted">' + esc(u.userPrincipalName || u.mail || '') + '</span></div>' +
+    '<div class="row muted">' + esc(u.id) + '</div>' +
+    '<div class="actions" data-user-id="' + esc(u.id) + '" data-user-label="' + esc(u.displayName || u.id) + '">' +
+    '<button data-action="install-app">instalar app aqui</button>' +
+    '<button data-action="open-dm">abrir DM e usar como destinatário</button>' +
+    '<span class="muted feedback"></span>' +
+    '</div></div>'
+  ).join('');
+}
+
+$('#teams-load-users').addEventListener('click', async () => {
+  const resultEl = $('#teams-users-result');
+  resultEl.textContent = 'carregando…';
+  try {
+    teamsUsersCache = await fetchJson('/api/teams/users');
+    resultEl.textContent = teamsUsersCache.length + ' usuários carregados';
+    $('#teams-users-list').innerHTML = renderTeamsUsers(teamsUsersCache, $('#teams-user-filter').value);
+  } catch (error) {
+    resultEl.textContent = 'erro ao carregar: ' + error.message;
+  }
+});
+
+$('#teams-user-filter').addEventListener('input', () => {
+  $('#teams-users-list').innerHTML = renderTeamsUsers(teamsUsersCache, $('#teams-user-filter').value);
+});
+
+$('#teams-users-list').addEventListener('click', async (event) => {
+  const button = event.target.closest('.actions button[data-action]');
+  if (!button) return;
+  // evita que o listener genérico de ações de mensagem (document, mais abaixo) também trate este clique —
+  // ambos usam a classe .actions para reaproveitar o estilo, mas são handlers independentes
+  event.stopPropagation();
+  const actions = button.closest('.actions');
+  const userId = actions.dataset.userId;
+  const userLabel = actions.dataset.userLabel;
+  const feedback = actions.querySelector('.feedback');
+
+  if (button.dataset.action === 'install-app') {
+    const appId = $('#teams-app-id').value.trim();
+    if (!appId) { feedback.textContent = 'informe o id do app no catálogo acima'; return; }
+    if (!confirm('Instalar o app "' + appId + '" para ' + userLabel + '?')) return;
+
+    feedback.textContent = 'instalando…';
+    try {
+      const res = await fetch('/api/teams/install', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId, appId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      feedback.textContent = res.ok ? 'instalado ✓' : 'erro ' + res.status + ': ' + JSON.stringify(data);
+    } catch (error) {
+      feedback.textContent = 'falha: ' + error.message;
+    }
+    return;
+  }
+
+  if (button.dataset.action === 'open-dm') {
+    feedback.textContent = 'abrindo DM…';
+    try {
+      const res = await fetch('/api/teams/dm', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ userId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        feedback.textContent = 'erro ' + res.status + ': ' + JSON.stringify(data);
+        return;
+      }
+      $('#to-input').value = data.channelId;
+      feedback.textContent = 'DM aberta ✓ — destinatário preenchido no envio acima';
+    } catch (error) {
+      feedback.textContent = 'falha: ' + error.message;
+    }
+  }
+});
 
 function typingReply() {
   const active = document.activeElement;

@@ -39,7 +39,13 @@ const sendBodySchema = z.object({
 
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const { providers, store } = options;
-  const app = Fastify({ logger: options.logger ?? true });
+  // find-my-way (router do Fastify) rejeita silenciosamente (404) qualquer param
+  // de rota acima de maxParamLength (default: 100). O providerMessageId composto do
+  // Teams (conversationId + '|' + activityId) passa disso fácil — conversationId de
+  // chat 1:1 já vem com 130+ caracteres — então sem aumentar o limite aqui, toda rota
+  // de mensagem individual (/messages/:providerMessageId, /correct, /timeline) falha
+  // pra esse canal mesmo com o provider implementado corretamente.
+  const app = Fastify({ logger: options.logger ?? true, routerOptions: { maxParamLength: 300 } });
 
   await app.register(rawBody, { field: 'rawBody', global: false, runFirst: true });
 

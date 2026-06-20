@@ -1,4 +1,6 @@
 import { createPublicKey, createVerify } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { ChannelProvider, Logger } from '../../core/provider.js';
 import type { MessageStore } from '../../core/store.js';
 import type { InboundEvent, OutboundMessage, SendResult } from '../../core/types.js';
@@ -12,6 +14,19 @@ export interface TeamsConfig {
    * Omitir para multi-tenant (usa 'botframework.com' como tenant do token).
    */
   tenantId?: string | undefined;
+  /**
+   * Caminho de um arquivo onde o cache de serviceUrl (necessário para mensagens
+   * proativas) é persistido entre restarts. Sem isso, o cache vive só em memória
+   * e qualquer restart (inclusive os do `tsx watch` durante o dev) exige que o bot
+   * receba uma nova activity antes que `openDM`/proativas voltem a funcionar.
+   */
+  statePath?: string | undefined;
+}
+
+interface TeamsPersistedState {
+  serviceUrls: Record<string, string>;
+  defaultServiceUrl: string | null;
+  defaultTenantId: string | null;
 }
 
 interface JwkRsaKey {
@@ -31,9 +46,13 @@ const BOT_FRAMEWORK_ISSUER = 'https://api.botframework.com';
 export class TeamsProvider implements ChannelProvider {
   readonly channel = 'teams' as const;
 
-  // OAuth2 token cache
+  // OAuth2 token cache (Bot Framework Connector API)
   private accessToken: string | null = null;
   private tokenExpiry = 0;
+
+  // OAuth2 token cache (Microsoft Graph — escopo e permissões separados do Bot Framework)
+  private graphAccessToken: string | null = null;
+  private graphTokenExpiry = 0;
 
   // JWKS cache para verificação de JWT inbound
   private jwksKeys: JwkRsaKey[] = [];
@@ -50,6 +69,7 @@ export class TeamsProvider implements ChannelProvider {
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   async start(_context: { store: MessageStore; log: Logger }): Promise<void> {
+    this.loadState();
     await this.refreshJwks();
     // Chaves do Bot Framework rotacionam esporadicamente — refresh diário
     this.jwksRefreshTimer = setInterval(
@@ -96,6 +116,7 @@ export class TeamsProvider implements ChannelProvider {
     if (activity.channelData?.tenant?.id) {
       this.defaultTenantId = activity.channelData.tenant.id;
     }
+    this.saveState();
 
     switch (activity.type) {
       case 'message':
@@ -183,9 +204,15 @@ export class TeamsProvider implements ChannelProvider {
     const content = message.content;
 
     if (content.kind === 'reaction') {
-      // Envio de reações exige Microsoft Graph API (escopo separado)
+      // Sem caminho viável: Bot Framework Connector não expõe nenhuma operação de
+      // reação (só recebe `messageReaction`); Microsoft Graph `setReaction` não aceita
+      // permissão de aplicativo, só delegada — e mesmo com OAuth delegado a reação
+      // apareceria como tendo sido feita pelo usuário logado, não pelo bot.
+      // Ver docs/learnings.md (Microsoft Teams) para os detalhes da investigação.
       throw new Error(
-        'Teams: envio de reações não suportado via Bot Framework — use Microsoft Graph API',
+        'Teams: bot não pode enviar reações com a própria identidade — nem Bot Framework ' +
+          'nem Microsoft Graph (app-only) suportam; Graph delegado atribuiria a reação ao ' +
+          'usuário autenticado, não ao bot',
       );
     }
 
@@ -301,8 +328,11 @@ export class TeamsProvider implements ChannelProvider {
 
   /**
    * Abre (ou recupera) uma conversa 1:1 com um usuário.
-   * userId deve estar no formato Teams ("29:xxx") ou ser o AAD Object ID.
-   * Requer que o bot já tenha recebido ao menos uma atividade (para ter um serviceUrl cacheado).
+   * userId aceita tanto o AAD Object ID (vindo do Microsoft Graph) quanto o id
+   * Teams já no formato "29:xxx" (vindo do `from.id` de uma activity recebida) —
+   * o Bot Framework aceita os dois como member id sem prefixo artificial.
+   * Requer que o bot já tenha recebido ao menos uma atividade (para ter um serviceUrl cacheado)
+   * e que esteja instalado no escopo pessoal desse usuário.
    */
   async openDM(userId: string): Promise<string> {
     const serviceUrl = this.defaultServiceUrl;
@@ -313,11 +343,9 @@ export class TeamsProvider implements ChannelProvider {
       );
     }
 
-    const memberId = userId.startsWith('29:') ? userId : `29:${userId}`;
-
     const body: Record<string, unknown> = {
       bot: { id: `28:${this.config.appId}`, name: 'Bot' },
-      members: [{ id: memberId }],
+      members: [{ id: userId }],
       isGroup: false,
     };
     if (this.defaultTenantId) body['tenantId'] = this.defaultTenantId;
@@ -330,8 +358,72 @@ export class TeamsProvider implements ChannelProvider {
 
     const newServiceUrl = raw.serviceUrl ?? serviceUrl;
     this.serviceUrlCache.set(raw.id, newServiceUrl);
+    this.saveState();
 
     return raw.id;
+  }
+
+  // ── Provisionamento via Microsoft Graph ─────────────────────────────────────
+  // Não faz parte da interface ChannelProvider: instalar um app para um usuário
+  // é um conceito de administração do tenant, sem equivalente nos outros canais.
+  // Ver docs/learnings.md (seção Microsoft Teams) para o porquê dessa fricção.
+
+  /**
+   * Lista todos os usuários do tenant (id, nome, e-mail/UPN) via Microsoft Graph.
+   * Requer permissão de aplicativo `User.Read.All` com consentimento de admin.
+   */
+  async listOrgUsers(): Promise<
+    Array<{ id: string; displayName?: string; mail?: string; userPrincipalName?: string }>
+  > {
+    type GraphUser = {
+      id: string;
+      displayName?: string;
+      mail?: string;
+      userPrincipalName?: string;
+    };
+
+    const users: GraphUser[] = [];
+    let url: string | undefined =
+      'https://graph.microsoft.com/v1.0/users?$select=id,displayName,mail,userPrincipalName';
+
+    while (url) {
+      const token = await this.getGraphAccessToken();
+      const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        throw new Error(`Teams Graph GET /users → ${res.status}: ${await res.text()}`);
+      }
+      const json = (await res.json()) as { value: GraphUser[]; '@odata.nextLink'?: string };
+      users.push(...json.value);
+      url = json['@odata.nextLink'];
+    }
+
+    return users;
+  }
+
+  /**
+   * Instala um app do catálogo do tenant no escopo pessoal de um usuário (sem o
+   * usuário precisar abrir o Teams e adicionar manualmente).
+   * `userId` aceita o id (AAD Object ID) ou o userPrincipalName do usuário.
+   * `teamsAppCatalogId` é o id do app em `appCatalogs/teamsApps` (diferente do
+   * Application ID do App Registration) — só apps já publicados no catálogo do
+   * tenant podem ser instalados por essa via.
+   * Requer permissão de aplicativo `TeamsAppInstallation.ReadWriteForUser.All`.
+   */
+  async installApp(userId: string, teamsAppCatalogId: string): Promise<void> {
+    const token = await this.getGraphAccessToken();
+    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(userId)}/teamwork/installedApps`;
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        'teamsApp@odata.bind': `https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/${teamsAppCatalogId}`,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Teams Graph POST installedApps → ${res.status}: ${await res.text()}`);
+    }
   }
 
   // ── OAuth2 e JWKS ──────────────────────────────────────────────────────────
@@ -364,6 +456,43 @@ export class TeamsProvider implements ChannelProvider {
     this.tokenExpiry = Date.now() + json.expires_in * 1000;
 
     return this.accessToken;
+  }
+
+  private async getGraphAccessToken(): Promise<string> {
+    if (this.graphAccessToken && Date.now() < this.graphTokenExpiry - 60_000) {
+      return this.graphAccessToken;
+    }
+
+    // Client credentials para Graph exige o tenant real — 'botframework.com' (usado
+    // no token do Bot Framework para apps multi-tenant) não se aplica aqui.
+    if (!this.config.tenantId) {
+      throw new Error(
+        'Teams: TEAMS_TENANT_ID é obrigatório para chamadas ao Microsoft Graph ' +
+          '(provisionamento de usuários/apps não é suportado para bots multi-tenant sem tenant fixo)',
+      );
+    }
+
+    const res = await fetch(`${MICROSOFT_TOKEN_BASE}/${this.config.tenantId}/oauth2/v2.0/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: this.config.appId,
+        client_secret: this.config.appPassword,
+        scope: 'https://graph.microsoft.com/.default',
+      }).toString(),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`Teams Graph OAuth2: falha ao obter token → ${res.status}: ${detail}`);
+    }
+
+    const json = (await res.json()) as { access_token: string; expires_in: number };
+    this.graphAccessToken = json.access_token;
+    this.graphTokenExpiry = Date.now() + json.expires_in * 1000;
+
+    return this.graphAccessToken;
   }
 
   private async refreshJwks(): Promise<void> {
@@ -432,6 +561,36 @@ export class TeamsProvider implements ChannelProvider {
   }
 
   // ── Internos ───────────────────────────────────────────────────────────────
+
+  private loadState(): void {
+    if (!this.config.statePath) return;
+
+    let raw: string;
+    try {
+      raw = readFileSync(this.config.statePath, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
+
+    const state = JSON.parse(raw) as TeamsPersistedState;
+    this.serviceUrlCache = new Map(Object.entries(state.serviceUrls));
+    this.defaultServiceUrl = state.defaultServiceUrl;
+    this.defaultTenantId = state.defaultTenantId;
+  }
+
+  private saveState(): void {
+    if (!this.config.statePath) return;
+
+    const state: TeamsPersistedState = {
+      serviceUrls: Object.fromEntries(this.serviceUrlCache),
+      defaultServiceUrl: this.defaultServiceUrl,
+      defaultTenantId: this.defaultTenantId,
+    };
+
+    mkdirSync(dirname(this.config.statePath), { recursive: true });
+    writeFileSync(this.config.statePath, JSON.stringify(state, null, 2));
+  }
 
   private requireServiceUrl(conversationId: string): string {
     const url = this.serviceUrlCache.get(conversationId) ?? this.defaultServiceUrl;
