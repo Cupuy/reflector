@@ -308,6 +308,17 @@ curl -X POST http://localhost:3000/api/teams/send \
 
 > **Diagnóstico de JWT:** se o servidor rejeitar as requests do Teams com assinatura inválida, inspecione o token em `http://localhost:4040` (ngrok inspector) — cole o valor do header `Authorization` em [jwt.ms](https://jwt.ms) e verifique se o campo `aud` bate com o `TEAMS_APP_ID`.
 
+### 6. Captar replies de canal sem @menção (Microsoft Graph change notifications)
+
+Por padrão, o bot só recebe activity de canal quando é @mencionado (limitação do Bot Framework Connector, não do reflector — ver `docs/learnings.md`). Para captar **todas** as mensagens de um canal, inclusive replies "soltas" numa thread:
+
+1. Conceda a permissão de aplicativo `ChannelMessage.Read.All` ao App Registration (**API permissions > Add a permission > Microsoft Graph > Application permissions**) e clique em **Grant admin consent**.
+2. Defina `PUBLIC_BASE_URL` no `.env` com a URL pública do servidor (a mesma do ngrok), **sem barra no final**.
+3. Garanta que o servidor e o ngrok já estejam de pé — o Graph valida a URL de callback de forma síncrona ao criar a assinatura (chamada precisa responder em poucos segundos).
+4. No dashboard, aba Teams > "Canais e conversas conhecidas" > carregue os destinos > clique em "ativar captura de replies (sem @menção)" no canal desejado.
+
+A assinatura expira em ~60 minutos e é renovada automaticamente em background enquanto o servidor estiver no ar; se ficar fora por mais tempo que isso, repita o passo 4.
+
 ---
 
 ## Referência rápida das variáveis
