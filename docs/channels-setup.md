@@ -210,7 +210,23 @@ Para criar o client secret:
 | `TEAMS_APP_PASSWORD` | **Certificates & secrets > Client secrets > Value** (copie ao criar) |
 | `TEAMS_TENANT_ID` | **Overview > Directory (tenant) ID** — omita para bots multitenant |
 
-### 2. Criar o Azure Bot Resource
+### 2. Conceder permissões de aplicativo (Microsoft Graph)
+
+Enviar/receber DM e mensagens de canal com @menção não exige nenhuma permissão Graph — só o Bot Framework (passo 1). As permissões abaixo só são necessárias para os recursos extra do dashboard (provisionamento e captura de replies sem @menção), mas como todas exigem **consentimento de admin** e usam o mesmo App Registration, é mais simples conceder todas de uma vez aqui:
+
+1. No App Registration: **API permissions > Add a permission > Microsoft Graph > Application permissions**
+2. Adicione as quatro abaixo e clique em **Grant admin consent for `<tenant>`**
+
+| Permissão | Para que serve |
+|---|---|
+| `User.Read.All` | Listar usuários do tenant no painel de provisionamento (`listOrgUsers`) |
+| `TeamsAppInstallation.ReadWriteForUser.All` | Instalar o bot no escopo pessoal de um usuário via Graph (`installApp`) — só funciona se o app já estiver publicado no catálogo do tenant, não para sideload |
+| `Channel.ReadBasic.All` | Distinguir canais privados (`🔒`) dos públicos na listagem de destinos (`membershipType`) |
+| `ChannelMessage.Read.All` | Assinar notificações de mudança para capturar replies de canal sem @menção (passo 7) |
+
+> Todas as chamadas Graph (não Bot Framework) exigem `TEAMS_TENANT_ID` configurado — sem ele, o provider lança erro explícito em vez de tentar um tenant multi-tenant inválido.
+
+### 3. Criar o Azure Bot Resource
 
 1. **Create a resource > Azure Bot**
 2. Preencha:
@@ -222,7 +238,7 @@ Para criar o client secret:
    - **Messaging endpoint**: `https://<ngrok>/webhooks/teams`
 4. Vá em **Channels > Microsoft Teams > Apply** para habilitar o canal
 
-### 3. Criar o app manifest do Teams
+### 4. Criar o app manifest do Teams
 
 Crie uma pasta `teams-app/` na raiz do projeto com:
 
@@ -268,7 +284,7 @@ Empacote:
 cd teams-app && zip ../reflector-bot.zip manifest.json color.png outline.png
 ```
 
-### 4. Instalar o bot no Teams (sideloading)
+### 5. Instalar o bot no Teams (sideloading)
 
 1. No Teams: **Apps** (barra lateral) > **Manage your apps**
 2. **Upload an app > Upload a custom app** > selecione `reflector-bot.zip`
@@ -276,7 +292,7 @@ cd teams-app && zip ../reflector-bot.zip manifest.json color.png outline.png
 
 > Se a opção de upload não aparecer, o admin do tenant precisa habilitar em **Teams Admin Center > Setup policies > Allow uploading custom apps**.
 
-### 5. Testar
+### 6. Testar
 
 O Teams só envia eventos após o bot estar instalado e o ngrok estar ativo com o endpoint configurado no Azure Bot.
 
@@ -308,16 +324,15 @@ curl -X POST http://localhost:3000/api/teams/send \
 
 > **Diagnóstico de JWT:** se o servidor rejeitar as requests do Teams com assinatura inválida, inspecione o token em `http://localhost:4040` (ngrok inspector) — cole o valor do header `Authorization` em [jwt.ms](https://jwt.ms) e verifique se o campo `aud` bate com o `TEAMS_APP_ID`.
 
-### 6. Captar replies de canal sem @menção (Microsoft Graph change notifications)
+### 7. Captar replies de canal sem @menção (Microsoft Graph change notifications)
 
-Por padrão, o bot só recebe activity de canal quando é @mencionado (limitação do Bot Framework Connector, não do reflector — ver `docs/learnings.md`). Para captar **todas** as mensagens de um canal, inclusive replies "soltas" numa thread:
+Por padrão, o bot só recebe activity de canal quando é @mencionado (limitação do Bot Framework Connector, não do reflector — ver `docs/learnings.md`). Para captar **todas** as mensagens de um canal, inclusive replies "soltas" numa thread (já com `ChannelMessage.Read.All` concedida no passo 2):
 
-1. Conceda a permissão de aplicativo `ChannelMessage.Read.All` ao App Registration (**API permissions > Add a permission > Microsoft Graph > Application permissions**) e clique em **Grant admin consent**.
-2. Defina `PUBLIC_BASE_URL` no `.env` com a URL pública do servidor (a mesma do ngrok), **sem barra no final**.
-3. Garanta que o servidor e o ngrok já estejam de pé — o Graph valida a URL de callback de forma síncrona ao criar a assinatura (chamada precisa responder em poucos segundos).
-4. No dashboard, aba Teams > "Canais e conversas conhecidas" > carregue os destinos > clique em "ativar captura de replies (sem @menção)" no canal desejado.
+1. Defina `PUBLIC_BASE_URL` no `.env` com a URL pública do servidor (a mesma do ngrok), **sem barra no final**.
+2. Garanta que o servidor e o ngrok já estejam de pé — o Graph valida a URL de callback de forma síncrona ao criar a assinatura (chamada precisa responder em poucos segundos).
+3. No dashboard, aba Teams > "Canais e conversas conhecidas" > carregue os destinos > clique em "ativar captura de replies (sem @menção)" no canal desejado.
 
-A assinatura expira em ~60 minutos e é renovada automaticamente em background enquanto o servidor estiver no ar; se ficar fora por mais tempo que isso, repita o passo 4.
+A assinatura expira em ~60 minutos e é renovada automaticamente em background enquanto o servidor estiver no ar; se ficar fora por mais tempo que isso, repita o passo 3.
 
 ---
 
