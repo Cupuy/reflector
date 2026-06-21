@@ -25,6 +25,11 @@ const envSchema = z.object({
   TEAMS_APP_ID: z.string().min(1).optional(),
   TEAMS_APP_PASSWORD: z.string().min(1).optional(),
   TEAMS_TENANT_ID: z.string().min(1).optional(), // omitir para bots multi-tenant
+  // Necessário só para assinaturas de change notification do Microsoft Graph (captura de
+  // replies de canal sem @menção) — diferente do webhook do Bot Framework, que é configurado
+  // colando a URL manualmente no Azure, aqui é a própria API que precisa saber sua URL pública
+  // para se autorregistrar como callback (POST /subscriptions). Ver docs/learnings.md.
+  PUBLIC_BASE_URL: z.string().url().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
