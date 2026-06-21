@@ -29,13 +29,26 @@
   nav.channels .tab[data-channel="slack"].active { border-color: var(--ch-slack); color: var(--ch-slack); }
   main { display: grid; gap: 16px; padding: 16px 20px; align-items: start; }
   main.all-channels { grid-template-columns: 1fr; }
-  main.single-channel { grid-template-columns: 1fr 1fr 1fr; }
+  /* minmax(0, 1fr) em vez de 1fr puro: o tamanho mínimo automático de uma coluna "1fr" é
+     "auto", que respeita o min-content dela — um id sem espaços (Teams/Slack) tem min-content
+     igual ao próprio comprimento da string, e isso sozinho já forçava a coluna a ficar mais
+     larga que as outras mesmo com fr iguais. minmax(0, 1fr) zera esse mínimo automático. */
+  main.single-channel { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr); }
   @media (max-width: 1100px) { main.single-channel { grid-template-columns: 1fr; } }
   section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; min-width: 0; }
   .card.highlight { border-color: var(--accent); }
-  .row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; min-width: 0; }
   .muted { color: var(--muted); font-size: 12px; }
+  /* Teams/Slack têm ids 4-5x mais longos que WhatsApp/Discord — sem isso, o header do
+     card quebra em 2-3 linhas e empurra tudo pra baixo. Valor completo fica no atributo
+     title (tooltip) e, sempre, no bloco "detalhes + payloads" abaixo.
+     row-id força nowrap: com flex-wrap:wrap (padrão de .row), o item flexível some pra uma
+     "linha" própria em vez de encolher — e sem encolher, overflow/ellipsis nunca entra em ação. */
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .row.row-id { flex-wrap: nowrap; }
+  .row > strong.truncate { flex: 1 1 auto; min-width: 0; }
+  .card > .row > .muted { flex-shrink: 0; }
   .badge { display: inline-block; padding: 0 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
   .badge.sent { color: var(--muted); }
   .badge.delivered { color: var(--accent); border-color: var(--accent); }
@@ -404,7 +417,7 @@ function renderOutbound(messages, timelines) {
     const isDiscord = m.channel === 'discord';
     const isTeamsChannel = isTeamsChannelMessage(m);
     return '<div class="card">' +
-      '<div class="row"><strong>→ ' + esc(m.recipient) + '</strong>' +
+      '<div class="row row-id"><strong class="truncate" title="' + esc(m.recipient) + '">→ ' + esc(m.recipient) + '</strong>' +
       '<span class="muted">' + fmtDate(m.sentAt) + '</span></div>' +
       '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
       '<div class="row">' + chain + '</div>' +
@@ -471,7 +484,7 @@ function renderInbound(messages) {
         ? m.providerMessageId.split('|')[0]
         : m.sender;
     return '<div class="card">' +
-    '<div class="row"><strong>← ' + esc(m.sender) + '</strong>' +
+    '<div class="row row-id"><strong class="truncate" title="' + esc(m.sender) + '">← ' + esc(m.sender) + '</strong>' +
     '<span class="muted">' + fmtDate(m.receivedAt) + '</span></div>' +
     '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
     (m.replyTo ? '<div class="row muted">↩ reply para ' + esc(m.replyTo.slice(0, 24)) + '…</div>' : '') +
@@ -614,9 +627,12 @@ function renderTeamsDestinations(destinations) {
     items.map((d) =>
       '<div class="card">' +
       '<div class="row"><strong>' + esc(d.label) + '</strong></div>' +
-      '<div class="row muted">' + esc(d.id) + '</div>' +
+      '<div class="muted truncate" title="' + esc(d.id) + '">' + esc(d.id) + '</div>' +
       '<div class="actions" data-destination-id="' + esc(d.id) + '">' +
       '<button data-action="use-destination">usar como destinatário</button>' +
+      (d.id.startsWith('channel:')
+        ? '<button data-action="subscribe-channel">ativar captura de replies (sem @menção)</button>'
+        : '') +
       '<span class="muted feedback"></span>' +
       '</div></div>'
     ).join('')
@@ -635,13 +651,36 @@ $('#teams-load-destinations').addEventListener('click', async () => {
   }
 });
 
-$('#teams-destinations-list').addEventListener('click', (event) => {
-  const button = event.target.closest('.actions button[data-action="use-destination"]');
+$('#teams-destinations-list').addEventListener('click', async (event) => {
+  const button = event.target.closest('.actions button[data-action]');
   if (!button) return;
   event.stopPropagation();
   const actions = button.closest('.actions');
-  $('#to-input').value = actions.dataset.destinationId;
-  actions.querySelector('.feedback').textContent = 'preenchido ✓ — clique em "compor mensagem" para enviar';
+  const destinationId = actions.dataset.destinationId;
+  const feedback = actions.querySelector('.feedback');
+
+  if (button.dataset.action === 'use-destination') {
+    $('#to-input').value = destinationId;
+    feedback.textContent = 'preenchido ✓ — clique em "compor mensagem" para enviar';
+    return;
+  }
+
+  if (button.dataset.action === 'subscribe-channel') {
+    feedback.textContent = 'ativando…';
+    try {
+      const res = await fetch('/api/teams/channel-subscriptions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ destinationId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      feedback.textContent = res.ok
+        ? 'ativado ✓ — expira ' + fmtDate(data.expirationDateTime)
+        : 'erro ' + res.status + ': ' + JSON.stringify(data);
+    } catch (error) {
+      feedback.textContent = 'falha: ' + error.message;
+    }
+  }
 });
 
 function typingReply() {

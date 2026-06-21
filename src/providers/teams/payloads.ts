@@ -67,3 +67,45 @@ export const teamsActivitySchema = z
   .passthrough();
 
 export type TeamsActivity = z.infer<typeof teamsActivitySchema>;
+
+// ── Microsoft Graph change notifications ────────────────────────────────────────
+// Protocolo completamente separado do Bot Framework Activity acima — usado só para
+// captar mensagens de canal que o bot não "vê" via Connector (replies sem @menção).
+// Ver docs/learnings.md (Microsoft Teams) para o porquê de existir um segundo protocolo.
+
+export const graphChangeNotificationSchema = z
+  .object({
+    subscriptionId: z.string(),
+    clientState: z.string().optional(),
+    changeType: z.string(), // 'created' | 'updated' | 'deleted'
+    // path que se pode dar de GET direto no Graph para obter o recurso atual —
+    // ex.: "teams('T')/channels('C')/messages('M')" ou ".../messages('M')/replies('R')"
+    resource: z.string(),
+    tenantId: z.string().optional(),
+  })
+  .passthrough();
+
+export const graphNotificationBodySchema = z.object({
+  value: z.array(graphChangeNotificationSchema),
+});
+
+// Forma mínima do chatMessage retornado pelo Graph ao buscar o recurso da notificação —
+// note que é uma forma bem diferente da activity do Bot Framework (body HTML, from.user
+// com AAD Object ID em vez do "29:..." que vem das activities — ver docs/learnings.md)
+export const graphChatMessageSchema = z
+  .object({
+    id: z.string(),
+    createdDateTime: z.string().optional(),
+    from: z
+      .object({
+        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional(),
+        application: z.object({ id: z.string() }).optional(),
+      })
+      .nullable()
+      .optional(),
+    body: z.object({ contentType: z.string().optional(), content: z.string() }),
+  })
+  .passthrough();
+
+export type GraphChangeNotification = z.infer<typeof graphChangeNotificationSchema>;
+export type GraphChatMessage = z.infer<typeof graphChatMessageSchema>;

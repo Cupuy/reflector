@@ -49,6 +49,7 @@ if (config.TEAMS_APP_ID !== undefined && config.TEAMS_APP_PASSWORD !== undefined
     appPassword: config.TEAMS_APP_PASSWORD,
     tenantId: config.TEAMS_TENANT_ID,
     statePath: join(dirname(config.DATABASE_PATH), 'teams-state.json'),
+    publicBaseUrl: config.PUBLIC_BASE_URL,
   });
   providers['teams'] = teamsProvider;
 }
@@ -71,6 +72,58 @@ if (teamsProvider) {
 
     await teamsProvider!.installApp(parsed.data.userId, parsed.data.appId);
     return reply.code(201).send({ ok: true });
+  });
+
+  // Change notifications do Microsoft Graph — segundo protocolo de webhook do Teams,
+  // paralelo a /webhooks/teams (Bot Framework Activity). Existe para captar mensagens de
+  // canal que o Connector nunca entrega ao bot (replies sem @menção — ver docs/learnings.md).
+  // Fica fora de app.ts pelo mesmo motivo das rotas de provisionamento acima: não há como
+  // expressar "um canal, dois webhooks" na interface agnóstica ChannelProvider.
+  app.post('/webhooks/teams-graph', async (request, reply) => {
+    // Handshake de validação: na criação da assinatura, o Graph faz uma POST com esse
+    // query param e espera a resposta ecoando o token de volta, em texto puro.
+    const validationToken = (request.query as Record<string, string>)?.['validationToken'];
+    if (validationToken !== undefined) {
+      return reply.type('text/plain').send(validationToken);
+    }
+
+    const signatureValid = teamsProvider!.verifyGraphClientState(request.body);
+    const webhookRequestId = store.saveWebhookRequest({
+      channel: 'teams',
+      headers: request.headers,
+      body: JSON.stringify(request.body),
+      signatureValid,
+    });
+
+    // Graph espera uma resposta rápida (poucos segundos) — processa o restante depois
+    await reply.code(202).send();
+
+    if (!signatureValid) {
+      app.log.warn({ webhookRequestId }, 'Teams Graph: clientState inválido — notificação ignorada');
+      return;
+    }
+
+    try {
+      const events = await teamsProvider!.handleGraphNotification(request.body);
+      for (const event of events) {
+        if (event.kind === 'message') {
+          store.saveInbound({ channel: 'teams', message: event.message, webhookRequestId });
+        }
+      }
+    } catch (error) {
+      app.log.error({ err: error, webhookRequestId }, 'Teams Graph: falha ao processar notificação');
+    }
+  });
+
+  // Ativa a captura de TODAS as mensagens de um canal (inclusive replies sem @menção)
+  app.post('/api/teams/channel-subscriptions', async (request, reply) => {
+    const parsed = z.object({ destinationId: z.string().min(1) }).safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'payload inválido', issues: parsed.error.issues });
+    }
+
+    const subscription = await teamsProvider!.subscribeToChannelMessages(parsed.data.destinationId);
+    return reply.code(201).send(subscription);
   });
 }
 

@@ -1,10 +1,16 @@
-import { createPublicKey, createVerify } from 'node:crypto';
+import { createPublicKey, createVerify, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { ChannelProvider, Logger } from '../../core/provider.js';
 import type { MessageStore } from '../../core/store.js';
 import type { InboundEvent, OutboundMessage, SendResult } from '../../core/types.js';
-import { teamsActivitySchema, type TeamsActivity } from './payloads.js';
+import {
+  graphChatMessageSchema,
+  graphNotificationBodySchema,
+  teamsActivitySchema,
+  type GraphChatMessage,
+  type TeamsActivity,
+} from './payloads.js';
 
 export interface TeamsConfig {
   appId: string;
@@ -21,6 +27,12 @@ export interface TeamsConfig {
    * receba uma nova activity antes que `openDM`/proativas voltem a funcionar.
    */
   statePath?: string | undefined;
+  /**
+   * URL pública do servidor (ex.: domínio do ngrok), usada só para autorregistrar o
+   * callback de change notifications do Microsoft Graph (`POST /subscriptions`).
+   * Sem isso, `subscribeToChannelMessages()` não tem como montar o `notificationUrl`.
+   */
+  publicBaseUrl?: string | undefined;
 }
 
 interface TeamsPersistedState {
@@ -30,6 +42,11 @@ interface TeamsPersistedState {
   // nome (se já visto) de cada team em que o bot foi instalado — null até a primeira
   // activity que o traga; usado só para rotular grupos em listDestinations()
   teamNames: Record<string, string | null>;
+  // segredo compartilhado com o Microsoft Graph, ecoado em toda change notification —
+  // gerado uma vez (lazy) e reaproveitado por todas as assinaturas futuras
+  graphClientState: string | null;
+  // assinaturas ativas de change notification por canal, chave `${teamId}|${channelId}`
+  channelSubscriptions: Record<string, { subscriptionId: string; expirationDateTime: string }>;
 }
 
 interface JwkRsaKey {
@@ -69,11 +86,19 @@ export class TeamsProvider implements ChannelProvider {
   // teams em que o bot foi instalado — teamId -> nome (null se ainda não observado)
   private teamNames = new Map<string, string | null>();
 
+  // segredo compartilhado com o Graph para validar change notifications (lazy, ver subscribeToChannelMessages)
+  private graphClientState: string | null = null;
+  // assinaturas ativas de change notification — chave `${teamId}|${channelId}`
+  private channelSubscriptions = new Map<string, { subscriptionId: string; expirationDateTime: string }>();
+  private subscriptionRenewalTimer: ReturnType<typeof setInterval> | null = null;
+  private log: Logger | null = null;
+
   constructor(private readonly config: TeamsConfig) {}
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-  async start(_context: { store: MessageStore; log: Logger }): Promise<void> {
+  async start(context: { store: MessageStore; log: Logger }): Promise<void> {
+    this.log = context.log;
     this.loadState();
     await this.refreshJwks();
     // Chaves do Bot Framework rotacionam esporadicamente — refresh diário
@@ -81,12 +106,22 @@ export class TeamsProvider implements ChannelProvider {
       () => { void this.refreshJwks(); },
       24 * 60 * 60 * 1000,
     );
+    // Assinaturas de canal expiram em ~60min (limite do Graph para chatMessage) — renova
+    // bem antes disso para tolerar o servidor ficar fora por um tempo entre checagens
+    this.subscriptionRenewalTimer = setInterval(
+      () => { void this.renewChannelSubscriptions(); },
+      15 * 60 * 1000,
+    );
   }
 
   async stop(): Promise<void> {
     if (this.jwksRefreshTimer !== null) {
       clearInterval(this.jwksRefreshTimer);
       this.jwksRefreshTimer = null;
+    }
+    if (this.subscriptionRenewalTimer !== null) {
+      clearInterval(this.subscriptionRenewalTimer);
+      this.subscriptionRenewalTimer = null;
     }
   }
 
@@ -573,6 +608,183 @@ export class TeamsProvider implements ChannelProvider {
     }
   }
 
+  // ── Change notifications (Microsoft Graph) ──────────────────────────────────
+  // Segundo protocolo de entrega de evento, paralelo ao Bot Framework Activity usado em
+  // parseWebhook(): o Connector só entrega activity de canal quando o bot é @mencionado
+  // (ver docs/learnings.md, item 1) — replies "soltas" numa thread nunca chegam por ali.
+  // Assinar `/teams/{teamId}/channels/{channelId}/messages` via Graph capta TUDO, ao custo
+  // de um handshake/validação e um shape de mensagem totalmente diferentes. Fica de fora
+  // de ChannelProvider de propósito — não dá pra expressar "dois webhooks para um canal"
+  // na interface agnóstica sem forçar os outros providers a saber disso.
+
+  /**
+   * Cria (ou reaproveita, se já existir) uma assinatura de change notification para todas
+   * as mensagens de um canal — inclusive replies sem @menção. `destinationId` é o mesmo id
+   * sintético `channel:<teamId>|<channelId>` usado em listDestinations()/send().
+   * Requer permissão de aplicativo `ChannelMessage.Read.All` e `PUBLIC_BASE_URL` configurado
+   * (o Graph valida a URL de callback de forma síncrona na criação — o servidor precisa
+   * estar acessível publicamente *antes* de chamar isto).
+   */
+  async subscribeToChannelMessages(
+    destinationId: string,
+  ): Promise<{ subscriptionId: string; expirationDateTime: string }> {
+    if (!destinationId.startsWith('channel:')) {
+      throw new Error(`Teams: subscribeToChannelMessages espera um destino "channel:...", recebeu "${destinationId}"`);
+    }
+    const [teamId, channelId] = splitCompositeId(destinationId.slice('channel:'.length));
+    const key = `${teamId}|${channelId}`;
+
+    const existing = this.channelSubscriptions.get(key);
+    if (existing) return existing;
+
+    if (!this.config.publicBaseUrl) {
+      throw new Error(
+        'Teams: PUBLIC_BASE_URL não configurado — necessário para o Graph saber onde entregar ' +
+          'as change notifications (ver docs/learnings.md, Microsoft Teams).',
+      );
+    }
+    if (!this.graphClientState) {
+      this.graphClientState = randomBytes(24).toString('hex');
+    }
+
+    const token = await this.getGraphAccessToken();
+    const expirationDateTime = new Date(Date.now() + 58 * 60 * 1000).toISOString();
+
+    const res = await fetch('https://graph.microsoft.com/v1.0/subscriptions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        changeType: 'created',
+        resource: `teams/${teamId}/channels/${channelId}/messages`,
+        notificationUrl: `${this.config.publicBaseUrl}/webhooks/teams-graph`,
+        expirationDateTime,
+        clientState: this.graphClientState,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Teams Graph POST /subscriptions → ${res.status}: ${await res.text()}`);
+    }
+
+    const raw = (await res.json()) as { id: string; expirationDateTime: string };
+    const subscription = { subscriptionId: raw.id, expirationDateTime: raw.expirationDateTime };
+    this.channelSubscriptions.set(key, subscription);
+    this.saveState();
+
+    return subscription;
+  }
+
+  /** Renova (best-effort) toda assinatura próxima de expirar — chamado pelo timer de start(). */
+  private async renewChannelSubscriptions(): Promise<void> {
+    const renewBefore = Date.now() + 25 * 60 * 1000;
+
+    for (const [key, sub] of this.channelSubscriptions) {
+      if (new Date(sub.expirationDateTime).getTime() > renewBefore) continue;
+
+      try {
+        const token = await this.getGraphAccessToken();
+        const expirationDateTime = new Date(Date.now() + 58 * 60 * 1000).toISOString();
+        const res = await fetch(`https://graph.microsoft.com/v1.0/subscriptions/${sub.subscriptionId}`, {
+          method: 'PATCH',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ expirationDateTime }),
+        });
+
+        if (res.status === 404) {
+          // Assinatura já expirou no Graph antes da renovação rodar — não tem o que renovar,
+          // só descartar; um novo subscribeToChannelMessages() recria do zero se necessário.
+          this.channelSubscriptions.delete(key);
+          continue;
+        }
+        if (!res.ok) {
+          throw new Error(`Teams Graph PATCH /subscriptions/${sub.subscriptionId} → ${res.status}: ${await res.text()}`);
+        }
+
+        const raw = (await res.json()) as { expirationDateTime: string };
+        this.channelSubscriptions.set(key, { ...sub, expirationDateTime: raw.expirationDateTime });
+      } catch (err) {
+        this.log?.warn('Teams: falha ao renovar assinatura de canal', { key, err: String(err) });
+      }
+    }
+
+    this.saveState();
+  }
+
+  /** Confere se uma notificação realmente veio do Graph (clientState compartilhado na criação). */
+  verifyGraphClientState(body: unknown): boolean {
+    const parsed = graphNotificationBodySchema.safeParse(body);
+    if (!parsed.success || !this.graphClientState) return false;
+    return parsed.data.value.every((entry) => entry.clientState === this.graphClientState);
+  }
+
+  /**
+   * Traduz uma change notification do Graph em eventos agnósticos. Cada entrada só traz um
+   * ponteiro (`resource`) — o conteúdo exige um GET adicional ao Graph antes de traduzir.
+   * IDs montados para colidir de propósito com o formato do Bot Framework (`docs/learnings.md`,
+   * item 3): `${channelId};messageid=${rootId}` é o mesmo conversationId que uma activity
+   * mencionada geraria — então uma mesma mensagem captada pelos dois caminhos dedupe sozinha
+   * via UNIQUE(provider_message_id) no store.
+   */
+  async handleGraphNotification(body: unknown): Promise<InboundEvent[]> {
+    if (!this.verifyGraphClientState(body)) return [];
+
+    const { value } = graphNotificationBodySchema.parse(body);
+    const events: InboundEvent[] = [];
+
+    for (const entry of value) {
+      if (entry.changeType !== 'created') continue;
+
+      const parsedResource = parseGraphResource(entry.resource);
+      if (!parsedResource) continue;
+      const { channelId, rootMessageId, replyMessageId } = parsedResource;
+
+      let raw: GraphChatMessage;
+      try {
+        raw = await this.fetchGraphResource(entry.resource);
+      } catch (err) {
+        this.log?.warn('Teams: falha ao buscar mensagem da change notification', { resource: entry.resource, err: String(err) });
+        continue;
+      }
+
+      // Mensagens do próprio bot vêm com from.application (sem from.user) — ignora, evita loop
+      if (!raw.from?.user) continue;
+
+      const text = htmlToPlainText(raw.body.content);
+      if (!text) continue;
+
+      const conversationId = `${channelId};messageid=${rootMessageId}`;
+      const messageId = replyMessageId ?? rootMessageId;
+
+      events.push({
+        kind: 'message',
+        message: {
+          providerMessageId: `${conversationId}|${messageId}`,
+          // AAD Object ID, não o "29:..." que vem das activities do Bot Framework para a
+          // mesma pessoa — namespaces de id diferentes entre os dois protocolos, sem ponte
+          // simples disponível (ver docs/learnings.md, Microsoft Teams).
+          from: raw.from.user.id,
+          timestamp: raw.createdDateTime ? new Date(raw.createdDateTime) : new Date(),
+          content: { kind: 'text', text },
+          ...(replyMessageId ? { replyTo: `${conversationId}|${rootMessageId}` } : {}),
+          raw,
+        },
+      });
+    }
+
+    return events;
+  }
+
+  private async fetchGraphResource(resource: string): Promise<GraphChatMessage> {
+    const token = await this.getGraphAccessToken();
+    const res = await fetch(`https://graph.microsoft.com/v1.0/${resource}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Teams Graph GET /${resource} → ${res.status}: ${await res.text()}`);
+    }
+    return graphChatMessageSchema.parse(await res.json());
+  }
+
   // ── OAuth2 e JWKS ──────────────────────────────────────────────────────────
 
   private async getAccessToken(): Promise<string> {
@@ -724,8 +936,11 @@ export class TeamsProvider implements ChannelProvider {
     this.serviceUrlCache = new Map(Object.entries(state.serviceUrls));
     this.defaultServiceUrl = state.defaultServiceUrl;
     this.defaultTenantId = state.defaultTenantId;
-    // `teamNames` não existe em arquivos de estado salvos antes dessa propriedade existir
+    // `teamNames`/`graphClientState`/`channelSubscriptions` não existem em arquivos de
+    // estado salvos antes dessas propriedades existirem
     this.teamNames = new Map(Object.entries(state.teamNames ?? {}));
+    this.graphClientState = state.graphClientState ?? null;
+    this.channelSubscriptions = new Map(Object.entries(state.channelSubscriptions ?? {}));
   }
 
   private saveState(): void {
@@ -736,6 +951,8 @@ export class TeamsProvider implements ChannelProvider {
       defaultServiceUrl: this.defaultServiceUrl,
       defaultTenantId: this.defaultTenantId,
       teamNames: Object.fromEntries(this.teamNames),
+      graphClientState: this.graphClientState,
+      channelSubscriptions: Object.fromEntries(this.channelSubscriptions),
     };
 
     mkdirSync(dirname(this.config.statePath), { recursive: true });
@@ -805,4 +1022,45 @@ function mimeFromMediaType(mediaType: string): string {
     case 'video': return 'video/*';
     default: return 'application/octet-stream';
   }
+}
+
+/**
+ * Extrai team/channel/mensagem do `resource` de uma change notification, ex.:
+ * "teams('T')/channels('C')/messages('ROOT')" (post novo) ou
+ * "teams('T')/channels('C')/messages('ROOT')/replies('REPLY')" (reply numa thread).
+ */
+function parseGraphResource(
+  resource: string,
+): { teamId: string; channelId: string; rootMessageId: string; replyMessageId: string | null } | null {
+  const match = /teams\('([^']+)'\)\/channels\('([^']+)'\)\/messages\('([^']+)'\)(?:\/replies\('([^']+)'\))?/.exec(
+    resource,
+  );
+  if (!match) return null;
+  const [, teamId, channelId, rootMessageId, replyMessageId] = match as unknown as [
+    string,
+    string,
+    string,
+    string,
+    string | undefined,
+  ];
+  return { teamId, channelId, rootMessageId, replyMessageId: replyMessageId ?? null };
+}
+
+/**
+ * Conversão simplificada do corpo HTML do chatMessage (Graph) para texto puro — sem
+ * dependência de parser de HTML, suficiente para o laboratório. Não trata formatação
+ * rica (listas, tabelas, menções inline) — registrado como simplificação conhecida em
+ * docs/learnings.md.
+ */
+function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<(br|\/p|\/div)\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
 }
