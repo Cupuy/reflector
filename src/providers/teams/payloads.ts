@@ -106,10 +106,16 @@ export const graphMessageReactionSchema = z
   .object({
     reactionType: z.string(),
     createdDateTime: z.string().optional(),
+    // O Graph retorna null explícito para campos ausentes em vez de omiti-los —
+    // todos os campos de identidade precisam de .nullable() além de .optional().
     user: z
       .object({
-        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional().nullable(),
+        user: z
+          .object({ id: z.string(), displayName: z.string().optional().nullable() })
+          .optional()
+          .nullable(),
       })
+      .passthrough()  // application/device também chegam como null no mesmo objeto
       .optional()
       .nullable(),
   })
@@ -124,7 +130,7 @@ export const graphChatMessageSchema = z
         // user é null quando a mensagem é do bot; application é null quando é de um usuário.
         // O Graph retorna null explícito (não campo ausente), então precisamos de .nullable()
         // além de .optional() em ambos — de outro modo o parse falha para mensagens de usuário.
-        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional().nullable(),
+        user: z.object({ id: z.string(), displayName: z.string().optional().nullable() }).optional().nullable(),
         application: z.object({ id: z.string() }).optional().nullable(),
       })
       .nullable()

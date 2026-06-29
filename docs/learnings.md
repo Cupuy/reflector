@@ -173,6 +173,16 @@ Para deduplicação via `INSERT OR IGNORE`, foi necessário construir um ID sint
 
 **Solução:** os IDs sintéticos foram montados para **colidir de propósito** com o formato que o Bot Framework já usa (`docs/learnings.md`, item 3 acima): `${channelId};messageid=${rootId}` é exatamente o `conversation.id` que uma activity mencionada geraria para a mesma thread. Resultado prático: se a mesma mensagem chegar pelos dois caminhos (ex.: uma reply que também @menciona o bot), o `providerMessageId` final é idêntico e o dedupe por `UNIQUE(provider_message_id)` do store absorve a duplicata sem nenhum código extra. O segundo protocolo inteiro (assinatura, handshake, renovação, tradução) ficou fora de `ChannelProvider`/`app.ts`, registrado direto em `TeamsProvider` + rotas Teams-específicas em `server/index.ts` — mesmo padrão já usado para o provisionamento via Graph (`listOrgUsers`/`installApp`).
 
+### 2026-06-29 — Graph retorna `null` explícito para campos ausentes em objetos de identidade
+
+**Sintoma:** change notifications de `created` (replies) e `updated` (reações em replies) chegavam com 202, mas nenhum evento era salvo. `fetchGraphResource` lançava Zod error capturado silenciosamente pelo `try-catch` em `handleGraphNotification`.
+
+**Causa:** o Microsoft Graph retorna `null` explícito (não campo ausente) para subcampos de identidade não preenchidos — `from.application: null` em mensagens de usuário, `from.user: null` em mensagens de bot, e `reactions[].user.user.displayName: null` quando indisponível. O Zod diferencia `undefined` (campo ausente, coberto por `.optional()`) de `null` (valor explícito, exige `.nullable()`). Sem `.nullable()`, o parse falha e o evento é descartado sem log visível.
+
+**Solução:** adicionar `.nullable()` em todos os campos de identidade dos schemas `graphChatMessageSchema` e `graphMessageReactionSchema`: `from.user`, `from.application`, `reactions[].user`, `reactions[].user.user.displayName`.
+
+**Regra para o projeto oficial:** ao modelar qualquer resposta do Microsoft Graph com Zod, use `.optional().nullable()` (ou `.nullish()`) em TODO campo opcional — especialmente em objetos de identidade aninhados (`from`, `user`, `application`, `device`). Nunca use só `.optional()` para campos de API externa.
+
 ### 2026-06-28 — `channelData.team.id` pode ser thread ID em vez de GUID no Microsoft Graph
 
 **Sintoma:** `POST /subscriptions` retornava `400 ExtensionError: TeamGroupId must be provided and in valid GUID format` mesmo com o destinatário correto selecionado no dashboard.
