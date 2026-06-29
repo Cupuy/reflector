@@ -60,6 +60,7 @@
   .badge.ch-discord { color: var(--ch-discord); border-color: var(--ch-discord); }
   .badge.ch-teams { color: var(--ch-teams); border-color: var(--ch-teams); }
   .badge.ch-slack { color: var(--ch-slack); border-color: var(--ch-slack); }
+  .card.reaction-card { border-left: 3px solid var(--warn); }
   details { margin-top: 8px; }
   summary { cursor: pointer; color: var(--accent); font-size: 12px; }
   pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0; max-height: 320px; }
@@ -265,12 +266,22 @@ function fmtDate(iso) {
   return iso ? new Date(iso).toLocaleString('pt-BR') : '';
 }
 
+// Nomes de reações do Teams → emoji Unicode (reactions do Bot Framework/Graph chegam como
+// strings tipo "like", "heart", etc., não como emoji — mapeamento para exibição humana)
+const TEAMS_REACTION_EMOJI = {
+  like: '👍', heart: '❤️', laugh: '😂', surprised: '😮', sad: '😢', angry: '😡',
+};
+
 function contentSummary(content) {
   if (!content || !content.kind) return '(sem conteúdo)';
   if (content.kind === 'text') return '"' + content.text + '"';
   if (content.kind === 'template') return 'template: ' + content.name;
   if (content.kind === 'media') return 'mídia: ' + content.mediaType;
-  if (content.kind === 'reaction') return 'reação: ' + (content.emoji || '(removida)');
+  if (content.kind === 'reaction') {
+    const emoji = content.emoji || '';
+    const display = TEAMS_REACTION_EMOJI[emoji] || emoji || '(removida)';
+    return display + ' reação' + (content.targetMessageId ? ' em …' + content.targetMessageId.slice(-12) : '');
+  }
   if (content.kind === 'choice') return 'escolha [' + content.source + ']: ' + content.label;
   if (content.kind === 'location') return 'localização: ' + content.latitude + ', ' + content.longitude;
   if (content.kind === 'contacts') return 'contatos (' + content.contacts.length + ')';
@@ -474,6 +485,11 @@ function renderInbound(messages) {
   return messages.map((m) => {
     const isDiscord = m.channel === 'discord';
     const isTeams = m.channel === 'teams';
+    const isReaction = m.content && m.content.kind === 'reaction';
+    // Origem da mensagem Teams: Graph (pmid sem '29:' e sem 'a:') vs Bot Framework
+    const isTeamsGraph = isTeams && m.providerMessageId &&
+      (m.providerMessageId.startsWith('rxn:graph:') ||
+       (!m.providerMessageId.startsWith('29:') && !m.providerMessageId.startsWith('a:') && !m.providerMessageId.startsWith('rxn:')));
     // Para Discord: `to` de reply é o channelId (parte antes do ':' no providerMessageId)
     // Para Teams: `to` de reply é o conversationId (parte antes do '|' no providerMessageId) —
     // `sender` é o id do usuário (29:xxx), que não é um conversationId válido para POST /v3/conversations/:id/activities
@@ -483,8 +499,14 @@ function renderInbound(messages) {
       : isTeams
         ? m.providerMessageId.split('|')[0]
         : m.sender;
-    return '<div class="card">' +
-    '<div class="row row-id"><strong class="truncate" title="' + esc(m.sender) + '">← ' + esc(m.sender) + '</strong>' +
+    const sourceBadge = isTeamsGraph
+      ? '<span class="badge" style="color:#7b83eb;border-color:#7b83eb">graph</span>'
+      : isTeams
+        ? '<span class="badge" style="color:#8b949e;border-color:#8b949e">bot</span>'
+        : '';
+    return '<div class="card' + (isReaction ? ' reaction-card' : '') + '">' +
+    '<div class="row row-id">' + channelBadge(m.channel) + sourceBadge +
+    '<strong class="truncate" title="' + esc(m.sender) + '">← ' + esc(m.sender) + '</strong>' +
     '<span class="muted">' + fmtDate(m.receivedAt) + '</span></div>' +
     '<div class="row">' + esc(contentSummary(m.content)) + '</div>' +
     (m.replyTo ? '<div class="row muted">↩ reply para ' + esc(m.replyTo.slice(0, 24)) + '…</div>' : '') +

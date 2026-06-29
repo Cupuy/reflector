@@ -3,12 +3,23 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import rawBody from 'fastify-raw-body';
 import { z } from 'zod';
 import type { ChannelProvider } from '../core/provider.js';
+import type { InboundEvent } from '../core/types.js';
 import type { MessageStore } from '../core/store.js';
+
+// Interface mínima para o handler de change notifications do Microsoft Graph —
+// evita importar TeamsProvider diretamente (mantém app.ts agnóstico de canal)
+export interface GraphNotificationHandler {
+  verifyGraphClientState: (body: unknown) => boolean;
+  handleGraphNotification: (body: unknown) => Promise<InboundEvent[]>;
+}
 
 export interface AppOptions {
   providers: Record<string, ChannelProvider>;
   store: MessageStore;
   logger?: boolean;
+  // Quando presente, registra /webhooks/teams-graph ANTES de /webhooks/:channel,
+  // garantindo prioridade de rota estática sobre parametrizada no find-my-way
+  graphNotificationHandler?: GraphNotificationHandler;
 }
 
 const sendBodySchema = z.object({
@@ -76,6 +87,47 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const html = await readFile(new URL('../../public/index.html', import.meta.url), 'utf8');
     return reply.type('text/html; charset=utf-8').send(html);
   });
+
+  // Change notifications do Microsoft Graph — rota específica registrada ANTES da rota
+  // parametrizada /webhooks/:channel para garantir precedência no find-my-way.
+  // A lógica fica aqui (não em index.ts) por esse motivo de ordering; o handler concreto
+  // chega via AppOptions para manter app.ts agnóstico de canal.
+  if (options.graphNotificationHandler) {
+    const graphHandler = options.graphNotificationHandler;
+    app.post('/webhooks/teams-graph', async (request, reply) => {
+      // Handshake de validação: Graph faz POST com ?validationToken=X e espera o token ecoado em texto puro
+      const validationToken = (request.query as Record<string, string>)?.['validationToken'];
+      if (validationToken !== undefined) {
+        return reply.type('text/plain').send(validationToken);
+      }
+
+      const signatureValid = graphHandler.verifyGraphClientState(request.body);
+      const webhookRequestId = store.saveWebhookRequest({
+        channel: 'teams',
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+        signatureValid,
+      });
+
+      await reply.code(202).send();
+
+      if (!signatureValid) {
+        request.log.warn({ webhookRequestId }, 'Teams Graph: clientState inválido — notificação ignorada');
+        return;
+      }
+
+      try {
+        const events = await graphHandler.handleGraphNotification(request.body);
+        for (const event of events) {
+          if (event.kind === 'message') {
+            store.saveInbound({ channel: 'teams', message: event.message, webhookRequestId });
+          }
+        }
+      } catch (error) {
+        request.log.error({ err: error, webhookRequestId }, 'Teams Graph: falha ao processar notificação');
+      }
+    });
+  }
 
   // Handshake de verificação do webhook (Meta envia GET com hub.challenge)
   app.get<{ Params: { channel: string } }>('/webhooks/:channel', async (request, reply) => {

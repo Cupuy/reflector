@@ -54,7 +54,11 @@ if (config.TEAMS_APP_ID !== undefined && config.TEAMS_APP_PASSWORD !== undefined
   providers['teams'] = teamsProvider;
 }
 
-const app = await buildApp({ providers, store });
+const app = await buildApp({
+  providers,
+  store,
+  ...(teamsProvider ? { graphNotificationHandler: teamsProvider } : {}),
+});
 
 // Provisionamento via Microsoft Graph — não é um conceito de ChannelProvider
 // (sem equivalente nos outros canais), por isso fica fora de app.ts.
@@ -72,47 +76,6 @@ if (teamsProvider) {
 
     await teamsProvider!.installApp(parsed.data.userId, parsed.data.appId);
     return reply.code(201).send({ ok: true });
-  });
-
-  // Change notifications do Microsoft Graph — segundo protocolo de webhook do Teams,
-  // paralelo a /webhooks/teams (Bot Framework Activity). Existe para captar mensagens de
-  // canal que o Connector nunca entrega ao bot (replies sem @menção — ver docs/learnings.md).
-  // Fica fora de app.ts pelo mesmo motivo das rotas de provisionamento acima: não há como
-  // expressar "um canal, dois webhooks" na interface agnóstica ChannelProvider.
-  app.post('/webhooks/teams-graph', async (request, reply) => {
-    // Handshake de validação: na criação da assinatura, o Graph faz uma POST com esse
-    // query param e espera a resposta ecoando o token de volta, em texto puro.
-    const validationToken = (request.query as Record<string, string>)?.['validationToken'];
-    if (validationToken !== undefined) {
-      return reply.type('text/plain').send(validationToken);
-    }
-
-    const signatureValid = teamsProvider!.verifyGraphClientState(request.body);
-    const webhookRequestId = store.saveWebhookRequest({
-      channel: 'teams',
-      headers: request.headers,
-      body: JSON.stringify(request.body),
-      signatureValid,
-    });
-
-    // Graph espera uma resposta rápida (poucos segundos) — processa o restante depois
-    await reply.code(202).send();
-
-    if (!signatureValid) {
-      app.log.warn({ webhookRequestId }, 'Teams Graph: clientState inválido — notificação ignorada');
-      return;
-    }
-
-    try {
-      const events = await teamsProvider!.handleGraphNotification(request.body);
-      for (const event of events) {
-        if (event.kind === 'message') {
-          store.saveInbound({ channel: 'teams', message: event.message, webhookRequestId });
-        }
-      }
-    } catch (error) {
-      app.log.error({ err: error, webhookRequestId }, 'Teams Graph: falha ao processar notificação');
-    }
   });
 
   // Ativa a captura de TODAS as mensagens de um canal (inclusive replies sem @menção)

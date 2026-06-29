@@ -46,7 +46,10 @@ interface TeamsPersistedState {
   // gerado uma vez (lazy) e reaproveitado por todas as assinaturas futuras
   graphClientState: string | null;
   // assinaturas ativas de change notification por canal, chave `${teamId}|${channelId}`
-  channelSubscriptions: Record<string, { subscriptionId: string; expirationDateTime: string }>;
+  channelSubscriptions: Record<string, { subscriptionId: string; expirationDateTime: string; changeType?: string }>;
+  // mapeamento threadId (19:xxx@thread.tacv2) → Azure AD Group ID (GUID) —
+  // o Graph exige o GUID para subscriptions, mas channelData.team.id às vezes vem como thread ID
+  teamAadGroupIds: Record<string, string>;
 }
 
 interface JwkRsaKey {
@@ -89,7 +92,9 @@ export class TeamsProvider implements ChannelProvider {
   // segredo compartilhado com o Graph para validar change notifications (lazy, ver subscribeToChannelMessages)
   private graphClientState: string | null = null;
   // assinaturas ativas de change notification — chave `${teamId}|${channelId}`
-  private channelSubscriptions = new Map<string, { subscriptionId: string; expirationDateTime: string }>();
+  private channelSubscriptions = new Map<string, { subscriptionId: string; expirationDateTime: string; changeType: string }>();
+  // threadId (19:xxx@thread.tacv2) → Azure AD Group ID (GUID) para chamadas ao Microsoft Graph
+  private teamAadGroupIds = new Map<string, string>();
   private subscriptionRenewalTimer: ReturnType<typeof setInterval> | null = null;
   private log: Logger | null = null;
 
@@ -157,11 +162,17 @@ export class TeamsProvider implements ChannelProvider {
       this.defaultTenantId = activity.channelData.tenant.id;
     }
     // Registra o team (se a activity veio de contexto de canal/grupo) — nome pode não
-    // vir em toda activity, então só sobrescreve quando de fato presente
+    // vir em toda activity, então só sobrescreve quando de fato presente.
+    // aadGroupId é o Azure AD Group ID (GUID) necessário para chamadas ao Microsoft Graph —
+    // channelData.team.id às vezes vem como thread ID (19:xxx@thread.tacv2) em vez de GUID.
     const teamId = activity.channelData?.team?.id;
     if (teamId) {
       const teamName = activity.channelData?.team?.name ?? this.teamNames.get(teamId) ?? null;
       this.teamNames.set(teamId, teamName);
+      const aadGroupId = activity.channelData?.team?.aadGroupId;
+      if (aadGroupId) {
+        this.teamAadGroupIds.set(teamId, aadGroupId);
+      }
     }
     this.saveState();
 
@@ -496,8 +507,10 @@ export class TeamsProvider implements ChannelProvider {
    * sem indicação de privacidade. Requer permissão de aplicativo `Channel.ReadBasic.All`.
    */
   private async fetchChannelMembershipTypes(teamId: string): Promise<Map<string, string>> {
+    const graphTeamId = this.teamAadGroupIds.get(teamId) ?? teamId;
+    if (!isGuid(graphTeamId)) throw new Error(`aadGroupId não disponível para team "${teamId}"`);
     const token = await this.getGraphAccessToken();
-    const url = `https://graph.microsoft.com/v1.0/teams/${encodeURIComponent(teamId)}/channels?$select=id,membershipType`;
+    const url = `https://graph.microsoft.com/v1.0/teams/${encodeURIComponent(graphTeamId)}/channels?$select=id,membershipType`;
 
     const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
     if (!res.ok) {
@@ -634,8 +647,26 @@ export class TeamsProvider implements ChannelProvider {
     const [teamId, channelId] = splitCompositeId(destinationId.slice('channel:'.length));
     const key = `${teamId}|${channelId}`;
 
+    // 'created,updated': 'created' captura mensagens novas e replies; 'updated' captura
+    // reações (que são atualizações do chatMessage, não novas entidades)
+    const requiredChangeType = 'created,updated';
+
     const existing = this.channelSubscriptions.get(key);
-    if (existing) return existing;
+    if (existing && (existing.changeType ?? 'created') === requiredChangeType) return existing;
+
+    // O Graph exige o Azure AD Group ID (GUID) como teamId — não o thread ID (19:xxx@thread.tacv2)
+    // que às vezes vem em channelData.team.id. Usa o aadGroupId capturado das activities quando
+    // disponível; caso contrário, resolve via Bot Framework Connector (GET /v3/teams/{id}) ou Graph beta.
+    let graphTeamId = this.teamAadGroupIds.get(teamId) ?? teamId;
+    if (!isGuid(graphTeamId)) {
+      graphTeamId = await this.resolveTeamAadGroupId(teamId) ?? teamId;
+    }
+    if (!isGuid(graphTeamId)) {
+      throw new Error(
+        `Teams: não foi possível resolver o Azure AD Group ID (GUID) para o team "${teamId}". ` +
+        `Verifique se o bot está instalado no team e se o serviceUrl está disponível.`,
+      );
+    }
 
     if (!this.config.publicBaseUrl) {
       throw new Error(
@@ -647,6 +678,35 @@ export class TeamsProvider implements ChannelProvider {
       this.graphClientState = randomBytes(24).toString('hex');
     }
 
+    // Remove trailing slash para evitar double-slash na URL de callback
+    const baseUrl = this.config.publicBaseUrl.replace(/\/+$/, '');
+    const callbackUrl = `${baseUrl}/webhooks/teams-graph`;
+
+    // Self-test: confirma que o endpoint de callback está acessível VIA URL pública antes de
+    // enviar a notificationUrl para o Graph. O Graph faz exatamente essa mesma requisição
+    // (POST ?validationToken=X) de forma síncrona durante a criação — se o self-test falhar,
+    // o Graph também vai falhar, e temos diagnóstico antes de desperdiçar uma chamada de API.
+    const selfTestToken = `self-${randomBytes(6).toString('hex')}`;
+    let selfTestOk = false;
+    try {
+      const selfRes = await fetch(`${callbackUrl}?validationToken=${selfTestToken}`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(8000),
+      });
+      const selfBody = (await selfRes.text()).trim();
+      selfTestOk = selfRes.ok && selfBody === selfTestToken;
+    } catch {
+      // continua — o erro vai aparecer na mensagem abaixo
+    }
+
+    if (!selfTestOk) {
+      throw new Error(
+        `Teams: endpoint de callback não respondeu corretamente em ${callbackUrl}\n` +
+        `PUBLIC_BASE_URL configurado: ${this.config.publicBaseUrl}\n` +
+        `Confirme que ngrok está ativo para essa URL e que o servidor está exposto publicamente.`,
+      );
+    }
+
     const token = await this.getGraphAccessToken();
     const expirationDateTime = new Date(Date.now() + 58 * 60 * 1000).toISOString();
 
@@ -654,24 +714,48 @@ export class TeamsProvider implements ChannelProvider {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({
-        changeType: 'created',
-        resource: `teams/${teamId}/channels/${channelId}/messages`,
-        notificationUrl: `${this.config.publicBaseUrl}/webhooks/teams-graph`,
+        changeType: requiredChangeType,
+        resource: `teams/${graphTeamId}/channels/${channelId}/messages`,
+        notificationUrl: callbackUrl,
         expirationDateTime,
         clientState: this.graphClientState,
       }),
     });
 
     if (!res.ok) {
-      throw new Error(`Teams Graph POST /subscriptions → ${res.status}: ${await res.text()}`);
+      const detail = await res.text();
+      throw new Error(
+        `Teams Graph POST /subscriptions → ${res.status}: ${detail}\n` +
+        `notificationUrl: ${callbackUrl}`,
+      );
     }
 
     const raw = (await res.json()) as { id: string; expirationDateTime: string };
-    const subscription = { subscriptionId: raw.id, expirationDateTime: raw.expirationDateTime };
+    const subscription = { subscriptionId: raw.id, expirationDateTime: raw.expirationDateTime, changeType: requiredChangeType };
+
+    // Apaga a assinatura antiga do Graph só depois de confirmar que a nova foi criada —
+    // se a criação falhasse antes (erro acima), a antiga permaneceria ativa no cache
+    if (existing) {
+      await this.deleteGraphSubscription(existing.subscriptionId);
+    }
+
     this.channelSubscriptions.set(key, subscription);
     this.saveState();
 
     return subscription;
+  }
+
+  /** Deleta uma assinatura no Graph (best-effort — ignora 404 e erros de rede). */
+  private async deleteGraphSubscription(subscriptionId: string): Promise<void> {
+    try {
+      const token = await this.getGraphAccessToken();
+      await fetch(`https://graph.microsoft.com/v1.0/subscriptions/${subscriptionId}`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${token}` },
+      });
+    } catch {
+      // best-effort — se já expirou ou foi deletada, não interfere na recriação
+    }
   }
 
   /** Renova (best-effort) toda assinatura próxima de expirar — chamado pelo timer de start(). */
@@ -732,55 +816,143 @@ export class TeamsProvider implements ChannelProvider {
     const events: InboundEvent[] = [];
 
     for (const entry of value) {
-      if (entry.changeType !== 'created') continue;
+      if (entry.changeType !== 'created' && entry.changeType !== 'updated') continue;
 
       const parsedResource = parseGraphResource(entry.resource);
       if (!parsedResource) continue;
-      const { channelId, rootMessageId, replyMessageId } = parsedResource;
+      const { teamId: notifTeamId, channelId, rootMessageId, replyMessageId } = parsedResource;
+
+      // Usa formato REST limpo (sem notação OData) para evitar ambiguidade do '@' em
+      // channelId ('19:xxx@thread.tacv2') dentro de chaves OData ('...') que o servidor
+      // Graph pode interpretar como anotação OData em vez de parte do valor.
+      const graphPath = replyMessageId
+        ? `teams/${notifTeamId}/channels/${channelId}/messages/${rootMessageId}/replies/${replyMessageId}`
+        : `teams/${notifTeamId}/channels/${channelId}/messages/${rootMessageId}`;
 
       let raw: GraphChatMessage;
       try {
-        raw = await this.fetchGraphResource(entry.resource);
+        raw = await this.fetchGraphResource(graphPath);
       } catch (err) {
-        this.log?.warn('Teams: falha ao buscar mensagem da change notification', { resource: entry.resource, err: String(err) });
+        this.log?.error('Teams: falha ao buscar mensagem da change notification', { resource: entry.resource, graphPath, err: String(err) });
         continue;
       }
 
-      // Mensagens do próprio bot vêm com from.application (sem from.user) — ignora, evita loop
-      if (!raw.from?.user) continue;
-
-      const text = htmlToPlainText(raw.body.content);
-      if (!text) continue;
-
       const conversationId = `${channelId};messageid=${rootMessageId}`;
       const messageId = replyMessageId ?? rootMessageId;
+      const providerMessageId = `${conversationId}|${messageId}`;
 
-      events.push({
-        kind: 'message',
-        message: {
-          providerMessageId: `${conversationId}|${messageId}`,
-          // AAD Object ID, não o "29:..." que vem das activities do Bot Framework para a
-          // mesma pessoa — namespaces de id diferentes entre os dois protocolos, sem ponte
-          // simples disponível (ver docs/learnings.md, Microsoft Teams).
-          from: raw.from.user.id,
-          timestamp: raw.createdDateTime ? new Date(raw.createdDateTime) : new Date(),
-          content: { kind: 'text', text },
-          ...(replyMessageId ? { replyTo: `${conversationId}|${rootMessageId}` } : {}),
-          raw,
-        },
-      });
+      if (entry.changeType === 'created') {
+        // Mensagens do próprio bot vêm com from.application (sem from.user) — ignora, evita loop.
+        // O check é só para 'created': para 'updated' (reações), o from é do autor da mensagem
+        // alvo (pode ser o bot), não do reactor — reactor está em reactions[i].user.user.id.
+        if (!raw.from?.user) continue;
+        const text = htmlToPlainText(raw.body.content);
+        if (!text) continue;
+
+        events.push({
+          kind: 'message',
+          message: {
+            providerMessageId,
+            // AAD Object ID, não o "29:..." que vem das activities do Bot Framework para a
+            // mesma pessoa — namespaces de id diferentes entre os dois protocolos, sem ponte
+            // simples disponível (ver docs/learnings.md, Microsoft Teams).
+            from: raw.from.user.id,
+            timestamp: raw.createdDateTime ? new Date(raw.createdDateTime) : new Date(),
+            content: { kind: 'text', text },
+            ...(replyMessageId ? { replyTo: `${conversationId}|${rootMessageId}` } : {}),
+            raw,
+          },
+        });
+      } else if (entry.changeType === 'updated' && raw.reactions && raw.reactions.length > 0) {
+        // 'updated' chega quando alguém reage a uma mensagem — o campo `reactions[]` traz
+        // o snapshot atual de todas as reações. Cada (reactor, emoji, mensagem) gera um
+        // evento com ID sintético estável; INSERT OR IGNORE absorve reentregas da mesma reação.
+        // Remoção de reação não é detectável com este modelo — limitação aceita no lab.
+        for (const reaction of raw.reactions) {
+          const reactorId = reaction.user?.user?.id;
+          if (!reactorId) continue;
+          events.push({
+            kind: 'message',
+            message: {
+              providerMessageId: `rxn:graph:${reactorId}:${conversationId}:${messageId}:${reaction.reactionType}`,
+              from: reactorId,
+              timestamp: reaction.createdDateTime ? new Date(reaction.createdDateTime) : new Date(),
+              content: {
+                kind: 'reaction',
+                targetMessageId: providerMessageId,
+                emoji: reaction.reactionType,
+              },
+              raw: reaction,
+            },
+          });
+        }
+      }
     }
 
     return events;
   }
 
-  private async fetchGraphResource(resource: string): Promise<GraphChatMessage> {
+  /**
+   * Resolve o Azure AD Group ID (GUID) para um team a partir do seu thread ID.
+   * Tenta primeiro o Bot Framework Connector (GET /v3/teams/{id}), depois o Graph beta API.
+   * Armazena o resultado em `teamAadGroupIds` para chamadas futuras.
+   */
+  private async resolveTeamAadGroupId(threadId: string): Promise<string | null> {
+    // Tentativa 1: Bot Framework Connector — GET /v3/teams/{teamId} retorna aadGroupId sem
+    // permissions extras, usando o mesmo token que já usamos para listar canais
+    const serviceUrl = this.defaultServiceUrl;
+    if (serviceUrl) {
+      try {
+        const token = await this.getAccessToken();
+        const res = await fetch(
+          `${normalizeServiceUrl(serviceUrl)}/v3/teams/${encodeURIComponent(threadId)}`,
+          { headers: { authorization: `Bearer ${token}` } },
+        );
+        if (res.ok) {
+          const json = (await res.json()) as { aadGroupId?: string };
+          if (json.aadGroupId && isGuid(json.aadGroupId)) {
+            this.teamAadGroupIds.set(threadId, json.aadGroupId);
+            this.saveState();
+            this.log?.info(`Teams: aadGroupId resolvido via Connector para "${threadId}": ${json.aadGroupId}`);
+            return json.aadGroupId;
+          }
+        }
+      } catch {
+        // continua para o fallback
+      }
+    }
+
+    // Tentativa 2: Graph beta API (requer Team.ReadBasic.All)
+    try {
+      const token = await this.getGraphAccessToken();
+      const res = await fetch(
+        `https://graph.microsoft.com/beta/teams?$filter=internalId eq '${encodeURIComponent(threadId)}'&$select=id`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      if (res.ok) {
+        const json = (await res.json()) as { value: Array<{ id: string }> };
+        const aadGroupId = json.value[0]?.id;
+        if (aadGroupId && isGuid(aadGroupId)) {
+          this.teamAadGroupIds.set(threadId, aadGroupId);
+          this.saveState();
+          this.log?.info(`Teams: aadGroupId resolvido via Graph beta para "${threadId}": ${aadGroupId}`);
+          return aadGroupId;
+        }
+      }
+    } catch {
+      // sem fallback disponível
+    }
+
+    return null;
+  }
+
+  private async fetchGraphResource(path: string): Promise<GraphChatMessage> {
     const token = await this.getGraphAccessToken();
-    const res = await fetch(`https://graph.microsoft.com/v1.0/${resource}`, {
-      headers: { authorization: `Bearer ${token}` },
-    });
+    const url = `https://graph.microsoft.com/v1.0/${path}`;
+    const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
     if (!res.ok) {
-      throw new Error(`Teams Graph GET /${resource} → ${res.status}: ${await res.text()}`);
+      const body = await res.text();
+      throw new Error(`Teams Graph GET ${url} → ${res.status}: ${body}`);
     }
     return graphChatMessageSchema.parse(await res.json());
   }
@@ -940,7 +1112,13 @@ export class TeamsProvider implements ChannelProvider {
     // estado salvos antes dessas propriedades existirem
     this.teamNames = new Map(Object.entries(state.teamNames ?? {}));
     this.graphClientState = state.graphClientState ?? null;
-    this.channelSubscriptions = new Map(Object.entries(state.channelSubscriptions ?? {}));
+    this.channelSubscriptions = new Map(
+      Object.entries(state.channelSubscriptions ?? {}).map(([k, v]) => [
+        k,
+        { ...v, changeType: v.changeType ?? 'created' },
+      ]),
+    );
+    this.teamAadGroupIds = new Map(Object.entries(state.teamAadGroupIds ?? {}));
   }
 
   private saveState(): void {
@@ -953,6 +1131,7 @@ export class TeamsProvider implements ChannelProvider {
       teamNames: Object.fromEntries(this.teamNames),
       graphClientState: this.graphClientState,
       channelSubscriptions: Object.fromEntries(this.channelSubscriptions),
+      teamAadGroupIds: Object.fromEntries(this.teamAadGroupIds),
     };
 
     mkdirSync(dirname(this.config.statePath), { recursive: true });
@@ -1022,6 +1201,11 @@ function mimeFromMediaType(mediaType: string): string {
     case 'video': return 'video/*';
     default: return 'application/octet-stream';
   }
+}
+
+/** Verifica se uma string é um GUID no formato padrão (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx). */
+function isGuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 /**

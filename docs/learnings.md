@@ -173,4 +173,26 @@ Para deduplicação via `INSERT OR IGNORE`, foi necessário construir um ID sint
 
 **Solução:** os IDs sintéticos foram montados para **colidir de propósito** com o formato que o Bot Framework já usa (`docs/learnings.md`, item 3 acima): `${channelId};messageid=${rootId}` é exatamente o `conversation.id` que uma activity mencionada geraria para a mesma thread. Resultado prático: se a mesma mensagem chegar pelos dois caminhos (ex.: uma reply que também @menciona o bot), o `providerMessageId` final é idêntico e o dedupe por `UNIQUE(provider_message_id)` do store absorve a duplicata sem nenhum código extra. O segundo protocolo inteiro (assinatura, handshake, renovação, tradução) ficou fora de `ChannelProvider`/`app.ts`, registrado direto em `TeamsProvider` + rotas Teams-específicas em `server/index.ts` — mesmo padrão já usado para o provisionamento via Graph (`listOrgUsers`/`installApp`).
 
+### 2026-06-28 — `channelData.team.id` pode ser thread ID em vez de GUID no Microsoft Graph
+
+**Sintoma:** `POST /subscriptions` retornava `400 ExtensionError: TeamGroupId must be provided and in valid GUID format` mesmo com o destinatário correto selecionado no dashboard.
+
+**Causa:** `channelData.team.id` nas activities do Bot Framework vem como thread ID (`19:xxx@thread.tacv2`) em vez do Azure AD Group ID (GUID `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) em alguns tenants — especialmente para o canal Geral, cujo channel ID é igual ao thread ID da equipe. O Microsoft Graph exige o GUID para qualquer chamada relativa ao team (subscriptions, `GET /teams/{id}/channels`, etc.), mas o Bot Framework Connector aceita os dois formatos.
+
+**Solução:** capturar `channelData.team.aadGroupId` das activities (adicionado ao schema) e persistir um mapeamento `threadId → aadGroupId` em `teams-state.json`. Em `subscribeToChannelMessages` e `fetchChannelMembershipTypes`, usar `teamAadGroupIds.get(teamId) ?? teamId` — se o aadGroupId ainda não estiver cacheado E o teamId não for um GUID, lançar erro explicativo pedindo que o bot receba uma activity do canal antes de assinar.
+
+**Fluxo prático:** enviar uma mensagem no canal (ou @mencionar o bot) → bot recebe a activity com `aadGroupId` → `teams-state.json` atualizado → chamar `POST /api/teams/channel-subscriptions` de novo.
+
+**Implicação para a abstração:** IDs de entidade do Teams não são intercambiáveis entre APIs. Bot Framework e Microsoft Graph usam namespaces de ID distintos para a mesma entidade (thread ID vs. AAD Group ID), sem nenhuma conversão automática. O projeto oficial precisa persistir explicitamente esse mapeamento ao primeiro contato com cada team.
+
+### 2026-06-27 — Reações de canal exigem `changeType: updated`, não `created`
+
+**Sintoma:** após assinar `teams/{teamId}/channels/{channelId}/messages` com `changeType: 'created'`, os replies chegavam (são eventos `created`) mas reações não — o bot simplesmente nunca recebia notificação quando alguém reagia a um post de canal.
+
+**Causa:** reações no Teams Graph não são entidades novas — elas modificam o `chatMessage` existente (o campo `reactions[]` é atualizado). O Graph entrega isso como `changeType: 'updated'` na notificação, não `created`. Uma assinatura sem `updated` nunca recebe esses eventos.
+
+**Solução:** assinatura criada com `changeType: 'created,updated'`. No handler de `updated`, busca-se a mensagem e itera-se sobre `reactions[]` para gerar eventos com providerMessageId estável `rxn:graph:{reactorId}:{conversationId}:{messageId}:{reactionType}`. Remoção de reação não é detectável com este modelo (a notificação `updated` não diz o que mudou, só que algo mudou — capturaríamos o estado pós-remoção com `reactions[]` vazio, mas não temos como saber qual foi removida sem cache de estado anterior). Limitação aceita no lab.
+
+**Assinaturas velhas (stale subscriptions):** ao adicionar `updated` à lógica, as assinaturas já cacheadas (criadas com `created` apenas) precisam ser recriadas. O `subscribeToChannelMessages` agora detecta se o `changeType` da assinatura em cache é diferente do requerido, deleta a assinatura velha do Graph (best-effort), remove do cache e recria. Para acionar o upgrade basta chamar `POST /api/teams/channel-subscriptions` de novo com o mesmo `destinationId`.
+
 **Implicação para a abstração:** este é o primeiro canal do laboratório com **dois webhooks concorrentes para o mesmo evento**. A interface `ChannelProvider` assume implicitamente "um webhook, um shape, uma verificação" (`handleVerification` + `verifySignature` + `parseWebhook`, todos síncronos) — Teams quebra as três premissas ao mesmo tempo (handshake via POST+query em vez de GET+challenge, verificação por segredo compartilhado em vez de assinatura, tradução assíncrona). Não vale generalizar `core` para isso a partir de uma amostra de um canal; o sinal a vigiar é se outro canal aparecer com a mesma necessidade de "ingestão completa vs. ingestão limitada por design" — se sim, *aí* vale desenhar um conceito de segundo canal de entrada na interface agnóstica.

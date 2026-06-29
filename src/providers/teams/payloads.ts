@@ -57,7 +57,14 @@ export const teamsActivitySchema = z
     entities: z.array(teamsEntitySchema).default([]),
     channelData: z
       .object({
-        team: z.object({ id: z.string(), name: z.string().optional() }).optional(),
+        // aadGroupId é o Azure AD Group ID (GUID) do team — diferente de team.id que às vezes
+        // vem como thread ID (19:xxx@thread.tacv2). O Graph exige o GUID; o Bot Framework
+        // Connector aceita os dois, mas Graph não. Ver docs/learnings.md (Microsoft Teams).
+        team: z.object({
+          id: z.string(),
+          name: z.string().optional(),
+          aadGroupId: z.string().optional(),
+        }).optional(),
         channel: z.object({ id: z.string(), name: z.string().optional() }).optional(),
         tenant: z.object({ id: z.string() }).optional(),
       })
@@ -92,20 +99,41 @@ export const graphNotificationBodySchema = z.object({
 // Forma mínima do chatMessage retornado pelo Graph ao buscar o recurso da notificação —
 // note que é uma forma bem diferente da activity do Bot Framework (body HTML, from.user
 // com AAD Object ID em vez do "29:..." que vem das activities — ver docs/learnings.md)
+
+// Reações a uma mensagem de canal — presentes no campo `reactions[]` do chatMessage
+// quando buscado via GET após uma change notification `updated`
+export const graphMessageReactionSchema = z
+  .object({
+    reactionType: z.string(),
+    createdDateTime: z.string().optional(),
+    user: z
+      .object({
+        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional().nullable(),
+      })
+      .optional()
+      .nullable(),
+  })
+  .passthrough();
+
 export const graphChatMessageSchema = z
   .object({
     id: z.string(),
     createdDateTime: z.string().optional(),
     from: z
       .object({
-        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional(),
-        application: z.object({ id: z.string() }).optional(),
+        // user é null quando a mensagem é do bot; application é null quando é de um usuário.
+        // O Graph retorna null explícito (não campo ausente), então precisamos de .nullable()
+        // além de .optional() em ambos — de outro modo o parse falha para mensagens de usuário.
+        user: z.object({ id: z.string(), displayName: z.string().optional() }).optional().nullable(),
+        application: z.object({ id: z.string() }).optional().nullable(),
       })
       .nullable()
       .optional(),
     body: z.object({ contentType: z.string().optional(), content: z.string() }),
+    reactions: z.array(graphMessageReactionSchema).optional(),
   })
   .passthrough();
 
 export type GraphChangeNotification = z.infer<typeof graphChangeNotificationSchema>;
 export type GraphChatMessage = z.infer<typeof graphChatMessageSchema>;
+export type GraphMessageReaction = z.infer<typeof graphMessageReactionSchema>;
